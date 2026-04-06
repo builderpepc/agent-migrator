@@ -4,6 +4,7 @@ import base64
 import json
 import os
 import platform
+import re
 import secrets
 import sqlite3
 import uuid
@@ -353,6 +354,110 @@ def _workspace_storage_dir() -> Path:
     return _global_db_path().parent.parent / "workspaceStorage"
 
 
+def _cursor_plans_dir() -> Path:
+    """~/.cursor/plans/ — where Cursor stores .plan.md files."""
+    return Path.home() / ".cursor" / "plans"
+
+
+_CURSOR_PLAN_FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n", re.DOTALL)
+
+
+def _strip_cursor_plan_frontmatter(content: str) -> str:
+    """Return just the markdown body of a Cursor .plan.md (strip YAML frontmatter)."""
+    m = _CURSOR_PLAN_FRONTMATTER_RE.match(content)
+    return content[m.end():].strip() if m else content.strip()
+
+
+def _build_cursor_plan_id(name: str) -> str:
+    """
+    Generate a Cursor plan ID: lowercase-underscored name + underscore + 8-hex hash.
+    e.g. "My Plan" -> "my_plan_a1b2c3d4"
+    """
+    slug = re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")
+    suffix = secrets.token_hex(4)
+    return f"{slug}_{suffix}"
+
+
+def _extract_todos_from_markdown(md: str) -> list[dict]:
+    """
+    Extract structured todos from a CC plan (pure markdown).
+    Priority: checkboxes → H2 headings → top-level numbered items → single catch-all.
+    Returns [{id, content, status}].
+    """
+    # 1. Checkbox items: - [x] done  /  - [ ] pending
+    checkbox_re = re.compile(r"^[-*]\s+\[([ xX])\]\s+(.+)$", re.MULTILINE)
+    todos = []
+    for m in checkbox_re.finditer(md):
+        done = m.group(1).strip().lower() == "x"
+        content = m.group(2).strip()
+        slug_id = re.sub(r"[^a-z0-9]+", "-", content.lower())[:40].strip("-")
+        todos.append({"id": slug_id, "content": content, "status": "completed" if done else "pending"})
+    if todos:
+        return todos
+
+    # 2. Level-2 headings (major plan phases, skip the H1 title)
+    heading_re = re.compile(r"^##\s+(?:\d+[.)]\s+)?(.+)$", re.MULTILINE)
+    for i, m in enumerate(heading_re.finditer(md), 1):
+        content = m.group(1).strip()
+        slug_id = re.sub(r"[^a-z0-9]+", "-", content.lower())[:40].strip("-") or str(i)
+        todos.append({"id": f"{i}-{slug_id}", "content": content, "status": "pending"})
+    if todos:
+        return todos
+
+    # 3. Top-level numbered list items (only lines not preceded by indentation)
+    numbered_re = re.compile(r"^(\d+)[.)]\s+\*{0,2}(.+?)\*{0,2}$", re.MULTILINE)
+    for m in numbered_re.finditer(md):
+        i = int(m.group(1))
+        content = m.group(2).strip().rstrip(":")
+        slug_id = re.sub(r"[^a-z0-9]+", "-", content.lower())[:40].strip("-") or str(i)
+        todos.append({"id": f"{i}-{slug_id}", "content": content, "status": "pending"})
+    if todos:
+        return todos
+
+    # 4. Single catch-all
+    return [{"id": "implement-plan", "content": "Implement plan", "status": "pending"}]
+
+
+def _build_cursor_plan_file(name: str, plan_content: str) -> str:
+    """
+    Convert a CC plan (pure markdown) to a Cursor .plan.md file.
+    Generates YAML frontmatter from the plan content and appends the body.
+    """
+    # Overview: first non-blank, non-heading paragraph after the H1 title
+    body_lines = plan_content.splitlines()
+    overview = ""
+    past_h1 = False
+    for line in body_lines:
+        stripped = line.strip()
+        if not stripped:
+            if overview:  # stop at blank line after finding content
+                break
+            continue
+        if stripped.startswith("#"):
+            past_h1 = True
+            continue
+        if past_h1:
+            overview = stripped
+            # Keep collecting until blank line (handled above)
+
+    todos = _extract_todos_from_markdown(plan_content)
+
+    # Build YAML frontmatter (simple manual serialisation to avoid a dep on PyYAML)
+    def yaml_str(s: str) -> str:
+        escaped = s.replace("\\", "\\\\").replace('"', '\\"')
+        return f'"{escaped}"'
+
+    lines = ["---", f"name: {name}", f"overview: {overview}", "todos:"]
+    for t in todos:
+        lines.append(f"  - id: {t['id']}")
+        lines.append(f"    content: {yaml_str(t['content'])}")
+        lines.append(f"    status: {t['status']}")
+    lines.append("---")
+    lines.append("")
+    lines.append(plan_content)
+    return "\n".join(lines)
+
+
 def _now_ms() -> int:
     return int(datetime.now(timezone.utc).timestamp() * 1000)
 
@@ -641,6 +746,31 @@ class CursorAdapter(ToolAdapter):
 
         con.close()
 
+        # Read any plan associated with this conversation via planRegistry.
+        plan_content: str | None = None
+        global_db = _global_db_path()
+        if global_db.exists():
+            try:
+                gcon = sqlite3.connect(f"file:{global_db}?mode=ro", uri=True)
+                grow = gcon.execute(
+                    "SELECT value FROM ItemTable WHERE key = 'composer.planRegistry'"
+                ).fetchone()
+                gcon.close()
+                if grow and grow[0]:
+                    registry = json.loads(grow[0])
+                    for plan_meta in registry.values():
+                        if conv_id in plan_meta.get("referencedBy", []) or \
+                                conv_id == plan_meta.get("createdBy"):
+                            uri = plan_meta.get("uri", {})
+                            plan_path = Path(uri.get("fsPath", ""))
+                            if plan_path.exists():
+                                plan_content = _strip_cursor_plan_frontmatter(
+                                    plan_path.read_text(encoding="utf-8")
+                                ) or None
+                                break
+            except Exception:
+                pass
+
         info = ConversationInfo(
             id=conv_id,
             name=name,
@@ -650,7 +780,7 @@ class CursorAdapter(ToolAdapter):
             size_bytes=0,
             source_tool=self.tool_id,
         )
-        return Conversation(info=info, turns=turns)
+        return Conversation(info=info, turns=turns, plan_content=plan_content)
 
     def write_conversation(self, conv: Conversation, project_path: Path) -> str:
         ws_dir = _find_workspace_dir(project_path)
@@ -1062,6 +1192,80 @@ class CursorAdapter(ToolAdapter):
 
         finally:
             con.close()
+
+        # Write plan file and register it if the conversation carried one.
+        if conv.plan_content:
+            plan_name = conv.info.name or "Migrated Plan"
+            # Extract name from the first H1 heading if present
+            h1 = re.search(r"^#\s+(.+)$", conv.plan_content, re.MULTILINE)
+            if h1:
+                plan_name = h1.group(1).strip()
+
+            plan_id = _build_cursor_plan_id(plan_name)
+            plans_dir = _cursor_plans_dir()
+            plans_dir.mkdir(parents=True, exist_ok=True)
+            plan_file = plans_dir / f"{plan_id}.plan.md"
+            plan_file.write_text(
+                _build_cursor_plan_file(plan_name, conv.plan_content),
+                encoding="utf-8",
+            )
+
+            # Register in composer.planRegistry
+            plan_uri_path = str(plan_file).replace("\\", "/")
+            plan_entry = {
+                "id": plan_id,
+                "name": plan_name,
+                "uri": {
+                    "$mid": 1,
+                    "fsPath": str(plan_file),
+                    "_sep": 1,
+                    "external": f"file:///{plan_uri_path.lstrip('/')}",
+                    "path": f"/{plan_uri_path.lstrip('/')}",
+                    "scheme": "file",
+                },
+                "createdBy": composer_id,
+                "editedBy": [composer_id],
+                "referencedBy": [composer_id],
+                "builtBy": {},
+                "lastUpdatedAt": now_ms,
+                "createdAt": now_ms,
+            }
+            gh_plan_con = sqlite3.connect(str(global_db))
+            try:
+                with gh_plan_con:
+                    pr_row = gh_plan_con.execute(
+                        "SELECT value FROM ItemTable WHERE key = 'composer.planRegistry'"
+                    ).fetchone()
+                    registry = json.loads(pr_row[0]) if (pr_row and pr_row[0]) else {}
+                    registry[plan_id] = plan_entry
+                    gh_plan_con.execute(
+                        "INSERT OR REPLACE INTO ItemTable (key, value) VALUES (?, ?)",
+                        ("composer.planRegistry", json.dumps(registry)),
+                    )
+                    gh_plan_con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            finally:
+                gh_plan_con.close()
+
+            # Also update composerHeaders entry's referencedPlans
+            gh_ref_con = sqlite3.connect(str(global_db))
+            try:
+                with gh_ref_con:
+                    hrow = gh_ref_con.execute(
+                        "SELECT value FROM ItemTable WHERE key = 'composer.composerHeaders'"
+                    ).fetchone()
+                    hdata = json.loads(hrow[0]) if (hrow and hrow[0]) else {"allComposers": []}
+                    for c in hdata.get("allComposers", []):
+                        if c.get("composerId") == composer_id:
+                            c.setdefault("referencedPlans", [])
+                            if plan_id not in c["referencedPlans"]:
+                                c["referencedPlans"].append(plan_id)
+                            break
+                    gh_ref_con.execute(
+                        "INSERT OR REPLACE INTO ItemTable (key, value) VALUES (?, ?)",
+                        ("composer.composerHeaders", json.dumps(hdata)),
+                    )
+            finally:
+                gh_ref_con.close()
 
         return composer_id
 
