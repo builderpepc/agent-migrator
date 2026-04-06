@@ -177,6 +177,39 @@ _CC_TOOL_MAP: dict[str, tuple[str, int]] = {
     "exit-plan-mode-v2": ("todo_write", 35),
 }
 
+# Map Claude Code API model IDs to Cursor's internal model name strings.
+# Cursor uses its own naming scheme (observed from native conversation data).
+_DEFAULT_CURSOR_MODEL = "claude-4.6-sonnet-medium-thinking"
+_CC_TO_CURSOR_MODEL: dict[str, str] = {
+    "claude-sonnet-4-6":              "claude-4.6-sonnet-medium-thinking",
+    "claude-opus-4-6":                "claude-4.6-opus-medium-thinking",
+    "claude-sonnet-4-5":              "claude-4.5-sonnet-thinking",
+    "claude-sonnet-4-5-20250929":     "claude-4.5-sonnet-thinking",
+    "claude-opus-4-5":                "claude-4.5-opus-high-thinking",
+    "claude-opus-4-5-20251101":       "claude-4.5-opus-high-thinking",
+    "claude-haiku-4-5":               "claude-4.5-haiku-thinking",
+    "claude-haiku-4-5-20251001":      "claude-4.5-haiku-thinking",
+    "claude-opus-4-20250514":         "claude-4.0-opus-thinking",
+    "claude-sonnet-4-20250514":       "claude-4.0-sonnet-thinking",
+    "claude-3-7-sonnet-20250219":     "claude-3.7-sonnet-thinking",
+    "claude-3-5-sonnet-20241022":     "claude-3.5-sonnet",
+    "claude-3-5-haiku-20241022":      "claude-3.5-haiku",
+}
+
+
+def _cc_model_to_cursor(api_model: str | None) -> str:
+    """Return the Cursor model name for a CC API model ID, or the default."""
+    if not api_model:
+        return _DEFAULT_CURSOR_MODEL
+    # Exact match first.
+    if api_model in _CC_TO_CURSOR_MODEL:
+        return _CC_TO_CURSOR_MODEL[api_model]
+    # Prefix match for versioned IDs (e.g. "claude-sonnet-4-6-20260101").
+    for cc_id, cursor_name in _CC_TO_CURSOR_MODEL.items():
+        if api_model.startswith(cc_id):
+            return cursor_name
+    return _DEFAULT_CURSOR_MODEL
+
 
 def _file_uri(file_path: str) -> dict:
     """Build a VS Code URI object for a file path (used in codeBlocks)."""
@@ -1086,7 +1119,7 @@ class CursorAdapter(ToolAdapter):
                     "contextTokensUsed": 0,
                     "contextTokenLimit": 0,
                     "allAttachedFileCodeChunksUris": [],
-                    "modelConfig": {"modelName": "", "maxMode": False},
+                    "modelConfig": {"modelName": _cc_model_to_cursor(conv.model), "maxMode": False},
                     "subComposerIds": [],
                     "capabilityContexts": [],
                     "isQueueExpanded": True,

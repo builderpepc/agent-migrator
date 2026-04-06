@@ -493,7 +493,20 @@ class ClaudeCodeAdapter(ToolAdapter):
                     plan_content = turn.input["plan"].strip() or None
                     break
 
-        return Conversation(info=info, turns=turns, plan_content=plan_content)
+        # Extract the API model ID from the first assistant record.
+        model: str | None = None
+        for line in jsonl_file.read_text(encoding="utf-8", errors="replace").splitlines():
+            try:
+                rec = json.loads(line)
+            except Exception:
+                continue
+            if rec.get("type") == "assistant":
+                m = rec.get("message", {}).get("model", "")
+                if m and m != "<synthetic>":
+                    model = m
+                    break
+
+        return Conversation(info=info, turns=turns, plan_content=plan_content, model=model)
 
     def write_conversation(self, conv: Conversation, project_path: Path) -> str:
         encoded = encode_project_path(project_path.resolve())
