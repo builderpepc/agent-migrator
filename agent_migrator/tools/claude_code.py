@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import difflib
+import html as _html
 import json
 import os
 import re
@@ -421,16 +422,18 @@ class ClaudeCodeAdapter(ToolAdapter):
                         ts = _parse_timestamp(rec.get("timestamp"))
                         if text.startswith("<bash-input>"):
                             m = _BASH_TAG_RE.match(text)
-                            pending_bash_cmd = m.group(2).strip() if m else text
+                            raw = m.group(2) if m else text
+                            pending_bash_cmd = _html.unescape(raw).replace("\r\n", "\n").strip()
                         elif text.startswith("<bash-stdout") or text.startswith("<bash-stderr"):
                             # Collect stdout and stderr from this record
                             stdout = ""
                             stderr = ""
                             for m in _BASH_TAG_RE.finditer(text):
+                                cleaned = _html.unescape(m.group(2)).replace("\r\n", "\n").strip()
                                 if m.group(1).lower() == "bash-stdout":
-                                    stdout = m.group(2).strip()
+                                    stdout = cleaned
                                 elif m.group(1).lower() == "bash-stderr":
-                                    stderr = m.group(2).strip()
+                                    stderr = cleaned
                             output = "\n".join(filter(None, [stdout, stderr]))
                             # Combine with pending command into one message
                             if pending_bash_cmd is not None:
