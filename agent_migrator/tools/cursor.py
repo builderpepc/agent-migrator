@@ -171,6 +171,10 @@ _CC_TOOL_MAP: dict[str, tuple[str, int]] = {
     "NotebookEdit": ("edit_file_v2",       38),
     "TodoWrite":    ("todo_write",         35),
     "TodoRead":     ("read_file_v2",       40),
+    # CC plan-mode tool — converted to todo_write so Cursor shows it as a plan
+    "ExitPlanMode":   ("todo_write", 35),
+    "ExitPlanModeV2": ("todo_write", 35),
+    "exit-plan-mode-v2": ("todo_write", 35),
 }
 
 
@@ -197,13 +201,15 @@ def _file_uri(file_path: str) -> dict:
 
 def _adapt_cc_tool(
     turn: "ToolCallMessage", project_path: Path
-) -> tuple[str, int, str, str, list]:
+) -> tuple[str, int, str, str, list, dict]:
     """
     Map a Claude Code ToolCallMessage to Cursor's toolFormerData fields.
-    Returns (cursor_tool_name, cursor_tool_num, params_json, result_json, code_blocks).
+    Returns (cursor_tool_name, cursor_tool_num, params_json, result_json,
+             code_blocks, extra_bubble_fields).
 
-    code_blocks populates the bubble's top-level codeBlocks field, which is what
-    Cursor's renderer reads to display file content and diffs inline.
+    code_blocks populates the bubble's top-level codeBlocks field.
+    extra_bubble_fields contains additional top-level bubble fields (e.g. todos
+    for todo_write bubbles).
     """
     name = turn.name
     inp = turn.input or {}
@@ -211,7 +217,7 @@ def _adapt_cc_tool(
 
     # MCP tools (e.g. mcp_perplexity_perplexity_ask) → Cursor MCP type
     if name.startswith("mcp_"):
-        return name, 19, json.dumps(inp), raw_result, []
+        return name, 19, json.dumps(inp), raw_result, [], {}
 
     cursor_name, tool_num = _CC_TOOL_MAP.get(name, (name, 0))
     code_blocks: list = []
@@ -332,11 +338,21 @@ def _adapt_cc_tool(
         file_path = inp.get("notebook_path", inp.get("file_path", ""))
         params = {"relativeWorkspacePath": file_path}
         result = json.dumps({"success": True})
+    elif name in ("ExitPlanMode", "ExitPlanModeV2", "exit-plan-mode-v2"):
+        # Convert CC plan-mode exit to a Cursor todo_write tool call so that
+        # Cursor treats the conversation as having an active plan.
+        plan_text = inp.get("plan", "")
+        todos = _extract_todos_from_markdown(plan_text) if plan_text else []
+        params = {"todos": todos, "merge": True}
+        result = json.dumps({"success": True, "finalTodos": todos})
+        # The bubble needs a top-level `todos` field (array of JSON strings).
+        extra_fields = {"todos": [json.dumps(t) for t in todos]}
+        return cursor_name, tool_num, json.dumps(params), result, code_blocks, extra_fields
     else:
         params = inp
         result = raw_result
 
-    return cursor_name, tool_num, json.dumps(params), result, code_blocks
+    return cursor_name, tool_num, json.dumps(params), result, code_blocks, {}
 
 
 def _global_db_path() -> Path:
@@ -921,6 +937,8 @@ class CursorAdapter(ToolAdapter):
                 last_user_request_id = ""
                 last_bubble_id = ""
                 last_checkpoint_id = ""
+                first_todo_bubble_id = ""
+                plan_todos: list = []
 
                 for turn in conv.turns:
                     bubble_id = str(uuid.uuid4())
@@ -968,7 +986,7 @@ class CursorAdapter(ToolAdapter):
                         # ToolCallMessage → capabilityType 15 bubble
                         conversation_items.append({"bubbleId": bubble_id, "type": _TYPE_ASSISTANT})
                         tool_call_id = f"toolu_{uuid.uuid4().hex[:24]}"
-                        cursor_name, tool_num, params_str, result_str, code_blocks = _adapt_cc_tool(
+                        cursor_name, tool_num, params_str, result_str, code_blocks, extra_fields = _adapt_cc_tool(
                             turn, project_path
                         )
                         bubble = _make_bubble_base(bubble_id, _TYPE_ASSISTANT, ts_iso)
@@ -995,6 +1013,12 @@ class CursorAdapter(ToolAdapter):
                             "result": result_str,
                             "additionalData": additional_data,
                         }
+                        # Merge any extra top-level fields (e.g. `todos` for todo_write).
+                        bubble.update(extra_fields)
+                        # Track the first todo_write bubble for composerData.
+                        if cursor_name == "todo_write" and not first_todo_bubble_id:
+                            first_todo_bubble_id = bubble_id
+                            plan_todos = [json.loads(t) for t in extra_fields.get("todos", [])]
 
                     con.execute(
                         "INSERT OR REPLACE INTO cursorDiskKV (key, value) VALUES (?, ?)",
@@ -1065,7 +1089,6 @@ class CursorAdapter(ToolAdapter):
                     "modelConfig": {"modelName": "", "maxMode": False},
                     "subComposerIds": [],
                     "capabilityContexts": [],
-                    "todos": [],
                     "isQueueExpanded": True,
                     "hasUnreadMessages": False,
                     "gitHubPromptDismissed": False,
@@ -1094,6 +1117,9 @@ class CursorAdapter(ToolAdapter):
                     "latestChatGenerationUUID": last_user_request_id,
                     "isAgentic": is_agentic,
                     "debugModeSuggestionUsed": False,
+                    # Plan support: populate todos and point to the first todo_write bubble.
+                    "todos": plan_todos,
+                    "firstTodoWriteBubble": first_todo_bubble_id,
                 }
                 con.execute(
                     "INSERT OR REPLACE INTO cursorDiskKV (key, value) VALUES (?, ?)",
