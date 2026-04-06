@@ -47,6 +47,28 @@ The tool will launch an interactive TUI that walks you through:
 
 ---
 
+## What gets migrated
+
+### Cursor → Claude Code
+
+| Feature | Status |
+|---|---|
+| Text messages (user and assistant) | ✓ |
+| Tool calls (Read, Write, Edit, Bash, Glob, Grep, WebFetch, WebSearch) | ✓ |
+| Bash mode commands and output | ✓ |
+| Plan (most recent plan associated with the conversation) | ✓ |
+
+### Claude Code → Cursor
+
+| Feature | Status |
+|---|---|
+| Text messages (user and assistant) | ✓ |
+| Tool calls (Read, Write, Edit, Bash, Glob, Grep, WebFetch, WebSearch) | ✓ |
+| Bash mode commands and output | ✓ |
+| Plan | Partial — the plan document and todos are migrated, but Cursor does not treat the conversation as being in Plan Mode |
+
+---
+
 ## How it works
 
 ### Storage formats
