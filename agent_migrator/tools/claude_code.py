@@ -64,12 +64,13 @@ _CC_INTERNAL_CONTENT_RE = re.compile(
     r'^<(?:'
     r'command-(?:name|message|args)|'          # slash commands: /exit, /clear, etc.
     r'local-command-(?:caveat|stdout|stderr)|' # local command wrappers
-    r'bash-(?:input|stdout|stderr)|'           # bash tool blocks
     r'anysphere-remote-filesystem-content|'    # remote file content
     r'function_calls|result'                   # tool call wrappers
     r')[\s>]',
     re.IGNORECASE,
 )
+
+_BASH_TAG_RE = re.compile(r'<(bash-input|bash-stdout|bash-stderr)>([\s\S]*?)</\1>', re.IGNORECASE)
 
 
 def _extract_json_string_field(text: str, key: str) -> str | None:
@@ -333,6 +334,8 @@ class ClaudeCodeAdapter(ToolAdapter):
 
         # Map tool_use_id -> ToolCallMessage (pending result)
         pending_tool_calls: dict[str, ToolCallMessage] = {}
+        # Bash mode: accumulate command from <bash-input> to combine with its output
+        pending_bash_cmd: str | None = None
 
         with open(jsonl_file, encoding="utf-8") as f:
             for line in f:
@@ -415,12 +418,40 @@ class ClaudeCodeAdapter(ToolAdapter):
                                         ))
                     elif isinstance(content, str):
                         text = content.strip()
-                        if text and not _CC_INTERNAL_CONTENT_RE.match(text):
-                            turns.append(TextMessage(
-                                role="user",
-                                text=text,
-                                timestamp=_parse_timestamp(rec.get("timestamp")),
-                            ))
+                        ts = _parse_timestamp(rec.get("timestamp"))
+                        if text.startswith("<bash-input>"):
+                            m = _BASH_TAG_RE.match(text)
+                            pending_bash_cmd = m.group(2).strip() if m else text
+                        elif text.startswith("<bash-stdout") or text.startswith("<bash-stderr"):
+                            # Collect stdout and stderr from this record
+                            stdout = ""
+                            stderr = ""
+                            for m in _BASH_TAG_RE.finditer(text):
+                                if m.group(1).lower() == "bash-stdout":
+                                    stdout = m.group(2).strip()
+                                elif m.group(1).lower() == "bash-stderr":
+                                    stderr = m.group(2).strip()
+                            output = "\n".join(filter(None, [stdout, stderr]))
+                            # Combine with pending command into one message
+                            if pending_bash_cmd is not None:
+                                combined = f"$ {pending_bash_cmd}"
+                                if output:
+                                    combined += f"\n{output}"
+                                turns.append(TextMessage(role="user", text=combined, timestamp=ts))
+                                pending_bash_cmd = None
+                            elif output:
+                                turns.append(TextMessage(role="user", text=output, timestamp=ts))
+                        else:
+                            # Flush any orphaned pending command before moving on
+                            if pending_bash_cmd is not None:
+                                turns.append(TextMessage(role="user", text=f"$ {pending_bash_cmd}", timestamp=ts))
+                                pending_bash_cmd = None
+                            if text and not _CC_INTERNAL_CONTENT_RE.match(text):
+                                turns.append(TextMessage(
+                                    role="user",
+                                    text=text,
+                                    timestamp=ts,
+                                ))
 
         updated_at = _last_timestamp(jsonl_file) or datetime.fromtimestamp(
             jsonl_file.stat().st_mtime, tz=timezone.utc
