@@ -972,6 +972,7 @@ class CursorAdapter(ToolAdapter):
                 last_checkpoint_id = ""
                 first_todo_bubble_id = ""
                 plan_todos: list = []
+                is_agentic = any(isinstance(t, ToolCallMessage) for t in conv.turns)
                 # Track whether the next assistant text bubble is the direct
                 # response to the most recent user message (needs requestId set).
                 pending_asst_request_id = ""
@@ -1087,7 +1088,6 @@ class CursorAdapter(ToolAdapter):
                         "subagentSelections": {}, "browserSelections": {},
                     },
                 }
-                is_agentic = any(isinstance(t, ToolCallMessage) for t in conv.turns)
                 composer_data = {
                     "_v": 10,
                     "composerId": composer_id,
