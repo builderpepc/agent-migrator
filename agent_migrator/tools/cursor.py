@@ -25,6 +25,128 @@ _TYPE_ASSISTANT = 2
 _CAPABILITY_TOOL = 15
 _CAPABILITY_SKIP = {22, 30}  # internal/streaming placeholders
 
+# Reverse map: Cursor tool names → Claude Code tool names.
+_CURSOR_TO_CC_TOOL_MAP: dict[str, str] = {
+    "read_file":               "Read",
+    "read_file_v2":            "Read",
+    "edit_file":               "Edit",
+    "edit_file_v2":            "Edit",
+    "search_replace":          "Edit",   # rawArgs has file_path/old_string/new_string
+    "write":                   "Write",  # rawArgs has file_path/contents
+    "run_terminal_cmd":        "Bash",
+    "run_terminal_command_v2": "Bash",
+    "ripgrep_raw_search":      "Grep",
+    "grep":                    "Grep",
+    "glob_file_search":        "Glob",
+    "file_search":             "Glob",
+    "list_dir":                "Bash",
+    "list_dir_v2":             "Bash",
+    "web_search":              "WebSearch",
+    "web_fetch":               "WebFetch",
+    "codebase_search":         "Grep",
+    "semantic_search_full":    "Grep",
+}
+
+
+def _adapt_cursor_tool(tfd: dict, bubble: dict) -> tuple[str, dict, str]:
+    """
+    Map a Cursor toolFormerData record to a CC-compatible (name, input, result).
+    rawArgs carries the model's original arguments; params has the processed form.
+    Falls back to params for tools where rawArgs is empty (e.g. edit_file_v2).
+    """
+    name = tfd.get("name", "unknown")
+    raw_args_str = tfd.get("rawArgs", "")
+    params_str = tfd.get("params", "")
+    result_str = tfd.get("result", "")
+
+    try:
+        raw = json.loads(raw_args_str) if raw_args_str else {}
+    except Exception:
+        raw = {}
+    try:
+        params = json.loads(params_str) if params_str else {}
+    except Exception:
+        params = {}
+    try:
+        result_obj = json.loads(result_str) if result_str else {}
+    except Exception:
+        result_obj = {}
+
+    cc_name = _CURSOR_TO_CC_TOOL_MAP.get(name, name)
+
+    if cc_name == "Read":
+        # rawArgs: {"path": "..."} — maps to CC file_path
+        file_path = raw.get("path") or params.get("targetFile", "")
+        cc_input = {"file_path": file_path}
+        cc_result = result_obj.get("contents", result_str)
+
+    elif cc_name == "Edit":
+        if name == "search_replace":
+            # rawArgs has full edit context — perfect round-trip
+            cc_input = {
+                "file_path":  raw.get("file_path", ""),
+                "old_string": raw.get("old_string", ""),
+                "new_string": raw.get("new_string", ""),
+            }
+        else:
+            # edit_file_v2 rawArgs is empty; extract path from params
+            file_path = raw.get("file_path") or params.get("relativeWorkspacePath", "")
+            # Try to recover new content from codeBlocks
+            code_blocks = bubble.get("codeBlocks", [])
+            new_content = code_blocks[0].get("content", "") if code_blocks else ""
+            cc_input = {"file_path": file_path, "new_string": new_content}
+        cc_result = "Applied edit."
+
+    elif cc_name == "Write":
+        # rawArgs: {"file_path": "...", "contents": "..."}
+        cc_input = {
+            "file_path": raw.get("file_path") or params.get("relativeWorkspacePath", ""),
+            "content":   raw.get("contents", raw.get("content", "")),
+        }
+        cc_result = "File written successfully."
+
+    elif cc_name == "Bash":
+        if name in ("list_dir", "list_dir_v2"):
+            dir_path = raw.get("relative_workspace_path") or raw.get("path", ".")
+            cc_input = {"command": f"ls {dir_path}"}
+            files = result_obj.get("files") or result_obj.get("directoryTreeRoot", "")
+            cc_result = json.dumps(files) if not isinstance(files, str) else files
+        else:
+            cc_input = {"command": raw.get("command", "")}
+            cc_result = result_obj.get("output", result_str)
+
+    elif cc_name == "Grep":
+        if name in ("codebase_search", "semantic_search_full"):
+            cc_input = {"pattern": raw.get("query", raw.get("search_query", ""))}
+        else:
+            cc_input = {
+                "pattern": raw.get("pattern", ""),
+                "path":    raw.get("path", ""),
+            }
+        cc_result = json.dumps(result_obj) if result_obj else result_str
+
+    elif cc_name == "Glob":
+        cc_input = {
+            "pattern": raw.get("glob_pattern") or raw.get("globPattern", ""),
+        }
+        cc_result = json.dumps(result_obj) if result_obj else result_str
+
+    elif cc_name == "WebFetch":
+        cc_input = {"url": raw.get("url", "")}
+        cc_result = result_obj.get("markdown", result_str)
+
+    elif cc_name == "WebSearch":
+        cc_input = {"query": raw.get("search_term") or raw.get("searchTerm", "")}
+        refs = result_obj.get("references", result_str)
+        cc_result = json.dumps(refs) if not isinstance(refs, str) else refs
+
+    else:
+        cc_input = raw or params
+        cc_result = result_str
+
+    return cc_name, cc_input, cc_result
+
+
 # Map Claude Code tool names to Cursor equivalents (name, numeric tool ID).
 # Cursor's UI only renders tool bubbles for known numeric IDs; tool=0 is invisible.
 _CC_TOOL_MAP: dict[str, tuple[str, int]] = {
@@ -439,17 +561,11 @@ class CursorAdapter(ToolAdapter):
                     continue
                 elif capability == _CAPABILITY_TOOL:
                     tfd = bubble.get("toolFormerData") or {}
-                    tool_name = tfd.get("name", "unknown")
-                    raw_args = tfd.get("rawArgs", "{}")
-                    result = tfd.get("result", "")
-                    try:
-                        input_dict = json.loads(raw_args) if raw_args else {}
-                    except Exception:
-                        input_dict = {"raw": raw_args}
+                    tool_name, input_dict, result = _adapt_cursor_tool(tfd, bubble)
                     turns.append(ToolCallMessage(
                         name=tool_name,
                         input=input_dict,
-                        result=result if isinstance(result, str) else json.dumps(result),
+                        result=result,
                     ))
                 else:
                     # Regular assistant text bubble
