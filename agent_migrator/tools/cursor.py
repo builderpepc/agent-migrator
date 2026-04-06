@@ -758,16 +758,22 @@ class CursorAdapter(ToolAdapter):
                 gcon.close()
                 if grow and grow[0]:
                     registry = json.loads(grow[0])
+                    # Collect all plans associated with this conversation, pick most recent.
+                    matching: list[tuple[int, Path]] = []
                     for plan_meta in registry.values():
                         if conv_id in plan_meta.get("referencedBy", []) or \
                                 conv_id == plan_meta.get("createdBy"):
                             uri = plan_meta.get("uri", {})
                             plan_path = Path(uri.get("fsPath", ""))
                             if plan_path.exists():
-                                plan_content = _strip_cursor_plan_frontmatter(
-                                    plan_path.read_text(encoding="utf-8")
-                                ) or None
-                                break
+                                ts = plan_meta.get("lastUpdatedAt", 0)
+                                matching.append((ts, plan_path))
+                    if matching:
+                        matching.sort(key=lambda x: x[0], reverse=True)
+                        _, plan_path = matching[0]
+                        plan_content = _strip_cursor_plan_frontmatter(
+                            plan_path.read_text(encoding="utf-8")
+                        ) or None
             except Exception:
                 pass
 
@@ -909,9 +915,9 @@ class CursorAdapter(ToolAdapter):
             {"type": 29, "data": {}},
         ]
 
-        con = sqlite3.connect(str(global_db))
+        con = sqlite3.connect(str(global_db), timeout=30)
         try:
-            with con:  # transaction — rolls back automatically on exception
+            with con:  # transaction — rolls back on exception; con closed in finally
                 last_user_request_id = ""
                 last_bubble_id = ""
                 last_checkpoint_id = ""
@@ -1094,113 +1100,73 @@ class CursorAdapter(ToolAdapter):
                     (f"composerData:{composer_id}", json.dumps(composer_data)),
                 )
 
-            # Register in the workspace's composer list (separate connection/transaction)
-            ws_db = ws_dir / "state.vscdb"
-            ws_con = sqlite3.connect(str(ws_db))
-            try:
-                with ws_con:
-                    row = ws_con.execute(
-                        "SELECT value FROM ItemTable WHERE key = 'composer.composerData'"
-                    ).fetchone()
-                    if row and row[0]:
-                        existing = json.loads(row[0])
-                    else:
-                        existing = {}
-                    # Cursor workspaces use one of two formats for tracking composers:
-                    #   Old: allComposers[]  — ordered list of composer metadata objects
-                    #   New: selectedComposerIds[] + lastFocusedComposerIds[] — ID-only lists
-                    # Detect which format this workspace uses and update accordingly.
-                    new_entry = {
-                        "type": "head",
-                        "composerId": composer_id,
-                        "name": conv.info.name,
-                        "lastUpdatedAt": now_ms,
-                        "createdAt": now_ms,
-                        "unifiedMode": "agent",
-                        "forceMode": "edit",
-                        "hasUnreadMessages": False,
-                        "isArchived": False,
-                        "isDraft": False,
-                        "isWorktree": False,
-                        "isSpec": False,
-                        "isProject": False,
-                        "isBestOfNSubcomposer": False,
-                        "numSubComposers": 0,
-                        "referencedPlans": [],
-                        "totalLinesAdded": 0,
-                        "totalLinesRemoved": 0,
-                        "filesChangedCount": 0,
-                        "worktreeStartedReadOnly": False,
-                    }
-                    # Always update allComposers — Cursor uses this list for the
-                    # sidebar regardless of whether hasMigratedComposerData is set.
-                    existing.setdefault("allComposers", [])
-                    existing["allComposers"] = [new_entry] + existing["allComposers"]
-                    # Also update the ID-only lists used by migrated workspaces.
-                    existing.setdefault("selectedComposerIds", [])
-                    existing.setdefault("lastFocusedComposerIds", [])
-                    if composer_id not in existing["selectedComposerIds"]:
-                        existing["selectedComposerIds"] = [composer_id] + existing["selectedComposerIds"]
-                    if composer_id not in existing["lastFocusedComposerIds"]:
-                        existing["lastFocusedComposerIds"] = [composer_id] + existing["lastFocusedComposerIds"]
-                    ws_con.execute(
-                        "INSERT OR REPLACE INTO ItemTable (key, value) VALUES (?, ?)",
-                        ("composer.composerData", json.dumps(existing)),
-                    )
-            finally:
-                ws_con.close()
-
-            # Update global composer.composerHeaders so Cursor's sidebar
-            # immediately reflects the new conversation.
-            ws_json = ws_dir / "workspace.json"
-            try:
-                ws_json_data = json.loads(ws_json.read_text(encoding="utf-8"))
-                folder_uri = ws_json_data.get("folder", "")
-            except Exception:
-                folder_uri = ""
-            workspace_identifier = {
-                "id": ws_dir.name,
-                "uri": {
-                    "$mid": 1,
-                    "fsPath": str(project_path).replace("/", "\\"),
-                    "_sep": 1,
-                    "external": folder_uri,
-                    "path": "/" + str(project_path).replace("\\", "/").lstrip("/"),
-                    "scheme": "file",
-                },
-            }
-            global_header_entry = {**new_entry, "workspaceIdentifier": workspace_identifier}
-            gh_con = sqlite3.connect(str(global_db))
-            try:
-                with gh_con:
-                    gh_row = gh_con.execute(
-                        "SELECT value FROM ItemTable WHERE key = 'composer.composerHeaders'"
-                    ).fetchone()
-                    gh_data = json.loads(gh_row[0]) if (gh_row and gh_row[0]) else {"allComposers": []}
-                    gh_data.setdefault("allComposers", [])
-                    # Remove stale entry for this ID if present, then prepend.
-                    gh_data["allComposers"] = [
-                        c for c in gh_data["allComposers"] if c.get("composerId") != composer_id
-                    ]
-                    gh_data["allComposers"] = [global_header_entry] + gh_data["allComposers"]
-                    gh_con.execute(
-                        "INSERT OR REPLACE INTO ItemTable (key, value) VALUES (?, ?)",
-                        ("composer.composerHeaders", json.dumps(gh_data)),
-                    )
-            finally:
-                gh_con.close()
-
         finally:
             con.close()
 
-        # Write plan file and register it if the conversation carried one.
+        # Register in the workspace's composer list.
+        ws_db = ws_dir / "state.vscdb"
+        ws_con = sqlite3.connect(str(ws_db), timeout=30)
+        try:
+            with ws_con:
+                row = ws_con.execute(
+                    "SELECT value FROM ItemTable WHERE key = 'composer.composerData'"
+                ).fetchone()
+                if row and row[0]:
+                    existing = json.loads(row[0])
+                else:
+                    existing = {}
+                # Cursor workspaces use one of two formats for tracking composers:
+                #   Old: allComposers[]  — ordered list of composer metadata objects
+                #   New: selectedComposerIds[] + lastFocusedComposerIds[] — ID-only lists
+                # Detect which format this workspace uses and update accordingly.
+                new_entry = {
+                    "type": "head",
+                    "composerId": composer_id,
+                    "name": conv.info.name,
+                    "lastUpdatedAt": now_ms,
+                    "createdAt": now_ms,
+                    "unifiedMode": "agent",
+                    "forceMode": "edit",
+                    "hasUnreadMessages": False,
+                    "isArchived": False,
+                    "isDraft": False,
+                    "isWorktree": False,
+                    "isSpec": False,
+                    "isProject": False,
+                    "isBestOfNSubcomposer": False,
+                    "numSubComposers": 0,
+                    "referencedPlans": [],
+                    "totalLinesAdded": 0,
+                    "totalLinesRemoved": 0,
+                    "filesChangedCount": 0,
+                    "worktreeStartedReadOnly": False,
+                }
+                # Always update allComposers — Cursor uses this list for the
+                # sidebar regardless of whether hasMigratedComposerData is set.
+                existing.setdefault("allComposers", [])
+                existing["allComposers"] = [new_entry] + existing["allComposers"]
+                # Also update the ID-only lists used by migrated workspaces.
+                existing.setdefault("selectedComposerIds", [])
+                existing.setdefault("lastFocusedComposerIds", [])
+                if composer_id not in existing["selectedComposerIds"]:
+                    existing["selectedComposerIds"] = [composer_id] + existing["selectedComposerIds"]
+                if composer_id not in existing["lastFocusedComposerIds"]:
+                    existing["lastFocusedComposerIds"] = [composer_id] + existing["lastFocusedComposerIds"]
+                ws_con.execute(
+                    "INSERT OR REPLACE INTO ItemTable (key, value) VALUES (?, ?)",
+                    ("composer.composerData", json.dumps(existing)),
+                )
+        finally:
+            ws_con.close()
+
+        # Prepare plan data (file write + metadata) before opening any DB connection.
+        plan_id: str | None = None
+        plan_entry: dict | None = None
         if conv.plan_content:
             plan_name = conv.info.name or "Migrated Plan"
-            # Extract name from the first H1 heading if present
             h1 = re.search(r"^#\s+(.+)$", conv.plan_content, re.MULTILINE)
             if h1:
                 plan_name = h1.group(1).strip()
-
             plan_id = _build_cursor_plan_id(plan_name)
             plans_dir = _cursor_plans_dir()
             plans_dir.mkdir(parents=True, exist_ok=True)
@@ -1209,8 +1175,6 @@ class CursorAdapter(ToolAdapter):
                 _build_cursor_plan_file(plan_name, conv.plan_content),
                 encoding="utf-8",
             )
-
-            # Register in composer.planRegistry
             plan_uri_path = str(plan_file).replace("\\", "/")
             plan_entry = {
                 "id": plan_id,
@@ -1230,42 +1194,68 @@ class CursorAdapter(ToolAdapter):
                 "lastUpdatedAt": now_ms,
                 "createdAt": now_ms,
             }
-            gh_plan_con = sqlite3.connect(str(global_db))
-            try:
-                with gh_plan_con:
-                    pr_row = gh_plan_con.execute(
+
+        # Update global ItemTable in a single connection:
+        #   - composer.composerHeaders  (always)
+        #   - composer.planRegistry     (if plan)
+        # Using referencedPlans in composerHeaders entry (if plan).
+        ws_json = ws_dir / "workspace.json"
+        try:
+            ws_json_data = json.loads(ws_json.read_text(encoding="utf-8"))
+            folder_uri = ws_json_data.get("folder", "")
+        except Exception:
+            folder_uri = ""
+        workspace_identifier = {
+            "id": ws_dir.name,
+            "uri": {
+                "$mid": 1,
+                "fsPath": str(project_path).replace("/", "\\"),
+                "_sep": 1,
+                "external": folder_uri,
+                "path": "/" + str(project_path).replace("\\", "/").lstrip("/"),
+                "scheme": "file",
+            },
+        }
+        global_header_entry = {**new_entry, "workspaceIdentifier": workspace_identifier}
+        gh_con = sqlite3.connect(str(global_db), timeout=30)
+        try:
+            with gh_con:
+                # composerHeaders
+                gh_row = gh_con.execute(
+                    "SELECT value FROM ItemTable WHERE key = 'composer.composerHeaders'"
+                ).fetchone()
+                gh_data = json.loads(gh_row[0]) if (gh_row and gh_row[0]) else {"allComposers": []}
+                gh_data.setdefault("allComposers", [])
+                gh_data["allComposers"] = [
+                    c for c in gh_data["allComposers"] if c.get("composerId") != composer_id
+                ]
+                gh_data["allComposers"] = [global_header_entry] + gh_data["allComposers"]
+
+                # Attach referencedPlans to the new header entry if we have a plan.
+                if plan_id:
+                    for c in gh_data["allComposers"]:
+                        if c.get("composerId") == composer_id:
+                            c["referencedPlans"] = [plan_id]
+                            break
+
+                gh_con.execute(
+                    "INSERT OR REPLACE INTO ItemTable (key, value) VALUES (?, ?)",
+                    ("composer.composerHeaders", json.dumps(gh_data)),
+                )
+
+                # planRegistry
+                if plan_entry:
+                    pr_row = gh_con.execute(
                         "SELECT value FROM ItemTable WHERE key = 'composer.planRegistry'"
                     ).fetchone()
                     registry = json.loads(pr_row[0]) if (pr_row and pr_row[0]) else {}
                     registry[plan_id] = plan_entry
-                    gh_plan_con.execute(
+                    gh_con.execute(
                         "INSERT OR REPLACE INTO ItemTable (key, value) VALUES (?, ?)",
                         ("composer.planRegistry", json.dumps(registry)),
                     )
-                    gh_plan_con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-            finally:
-                gh_plan_con.close()
-
-            # Also update composerHeaders entry's referencedPlans
-            gh_ref_con = sqlite3.connect(str(global_db))
-            try:
-                with gh_ref_con:
-                    hrow = gh_ref_con.execute(
-                        "SELECT value FROM ItemTable WHERE key = 'composer.composerHeaders'"
-                    ).fetchone()
-                    hdata = json.loads(hrow[0]) if (hrow and hrow[0]) else {"allComposers": []}
-                    for c in hdata.get("allComposers", []):
-                        if c.get("composerId") == composer_id:
-                            c.setdefault("referencedPlans", [])
-                            if plan_id not in c["referencedPlans"]:
-                                c["referencedPlans"].append(plan_id)
-                            break
-                    gh_ref_con.execute(
-                        "INSERT OR REPLACE INTO ItemTable (key, value) VALUES (?, ?)",
-                        ("composer.composerHeaders", json.dumps(hdata)),
-                    )
-            finally:
-                gh_ref_con.close()
+        finally:
+            gh_con.close()
 
         return composer_id
 
@@ -1292,7 +1282,7 @@ class CursorAdapter(ToolAdapter):
         ws_db = ws_dir / "state.vscdb"
         if not ws_db.exists():
             return
-        ws_con = sqlite3.connect(str(ws_db))
+        ws_con = sqlite3.connect(str(ws_db), timeout=30)
         try:
             with ws_con:
                 row = ws_con.execute(

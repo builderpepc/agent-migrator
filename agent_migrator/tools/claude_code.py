@@ -504,8 +504,11 @@ class ClaudeCodeAdapter(ToolAdapter):
         final_path = session_dir / f"{session_id}.jsonl"
         tmp_path = session_dir / f"{session_id}.jsonl.tmp"
 
-        # Pick a slug: use source slug or derive from name
-        slug = re.sub(r"[^a-z0-9]+", "-", conv.info.name.lower()).strip("-") or session_id[:8]
+        # Pick a slug: use source slug or derive from name.
+        # Append a random suffix so migrated plan files don't collide with
+        # existing plans that share the same conversation name.
+        slug_base = re.sub(r"[^a-z0-9]+", "-", conv.info.name.lower()).strip("-") or session_id[:8]
+        slug = f"{slug_base}-{uuid.uuid4().hex[:8]}"
 
         try:
             with open(tmp_path, "w", encoding="utf-8") as f:
