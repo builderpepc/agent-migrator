@@ -88,14 +88,21 @@ def _adapt_cursor_tool(tfd: dict, bubble: dict) -> tuple[str, dict, str]:
                 "old_string": raw.get("old_string", ""),
                 "new_string": raw.get("new_string", ""),
             }
+            cc_result = "Applied edit."
         else:
-            # edit_file_v2 rawArgs is empty; extract path from params
+            # edit_file_v2: rawArgs is always empty. Cursor stores the new file
+            # content in params.streamingContent (falling back to codeBlocks).
+            # Since we only have the final content (no old_string), map to Write
+            # so the full file content is visible in CC history.
             file_path = raw.get("file_path") or params.get("relativeWorkspacePath", "")
-            # Try to recover new content from codeBlocks
             code_blocks = bubble.get("codeBlocks", [])
-            new_content = code_blocks[0].get("content", "") if code_blocks else ""
-            cc_input = {"file_path": file_path, "new_string": new_content}
-        cc_result = "Applied edit."
+            new_content = (
+                params.get("streamingContent", "")
+                or (code_blocks[0].get("content", "") if code_blocks else "")
+            )
+            cc_name = "Write"
+            cc_input = {"file_path": file_path, "content": new_content}
+            cc_result = "File written successfully."
 
     elif cc_name == "Write":
         # rawArgs: {"file_path": "...", "contents": "..."}
@@ -396,7 +403,16 @@ def _find_workspace_dir(project_path: Path) -> Path | None:
 
 
 def _get_composer_ids(workspace_db: Path) -> list[str]:
-    """Read the list of composerIds from a workspace-specific state.vscdb."""
+    """Read the list of composerIds for a workspace.
+
+    Priority order:
+    1. workspace DB composer.composerData.allComposers (legacy / temporary)
+    2. Global composer.composerHeaders filtered by this workspace's hash ID
+       (this is what Cursor uses as its authoritative sidebar source)
+    3. Workspace DB pane values — each value is a dict keyed by
+       'workbench.panel.aichat.view.<composerId>', giving only IDs for panes
+       actually opened in this workspace (avoids cross-workspace contamination).
+    """
     if not workspace_db.exists():
         return []
     try:
@@ -404,11 +420,62 @@ def _get_composer_ids(workspace_db: Path) -> list[str]:
         row = con.execute(
             "SELECT value FROM ItemTable WHERE key = 'composer.composerData'"
         ).fetchone()
+
+        data = json.loads(row[0]) if (row and row[0]) else {}
+        all_composers = [c["composerId"] for c in data.get("allComposers", []) if c.get("composerId")]
+
+        if all_composers:
+            con.close()
+            return all_composers
+
+        # Primary fallback: global composer.composerHeaders filtered by workspace hash.
+        workspace_hash = workspace_db.parent.name
+        global_db = _global_db_path()
+        if global_db.exists():
+            gcon = sqlite3.connect(f"file:{global_db}?mode=ro", uri=True)
+            grow = gcon.execute(
+                "SELECT value FROM ItemTable WHERE key = 'composer.composerHeaders'"
+            ).fetchone()
+            gcon.close()
+            if grow and grow[0]:
+                try:
+                    gh = json.loads(grow[0])
+                    ids = [
+                        c["composerId"]
+                        for c in gh.get("allComposers", [])
+                        if c.get("composerId")
+                        and c.get("workspaceIdentifier", {}).get("id") == workspace_hash
+                    ]
+                    if ids:
+                        con.close()
+                        return ids
+                except Exception:
+                    pass
+
+        # Last resort: parse pane values from this workspace's DB.
+        pane_rows = con.execute(
+            "SELECT value FROM ItemTable WHERE key LIKE 'workbench.panel.composerChatViewPane.%'"
+            " AND key NOT LIKE '%.hidden'"
+        ).fetchall()
         con.close()
-        if not row or not row[0]:
-            return []
-        data = json.loads(row[0])
-        return [c["composerId"] for c in data.get("allComposers", []) if c.get("composerId")]
+
+        prefix = "workbench.panel.aichat.view."
+        seen: set[str] = set()
+        composer_ids: list[str] = []
+        for (val,) in pane_rows:
+            if not val:
+                continue
+            try:
+                d = json.loads(val)
+            except Exception:
+                continue
+            for vk in d.keys():
+                if vk.startswith(prefix):
+                    cid = vk[len(prefix):]
+                    if cid and cid not in seen:
+                        seen.add(cid)
+                        composer_ids.append(cid)
+        return composer_ids
     except Exception:
         return []
 
@@ -935,23 +1002,63 @@ class CursorAdapter(ToolAdapter):
                         "filesChangedCount": 0,
                         "worktreeStartedReadOnly": False,
                     }
-                    if "allComposers" in existing:
-                        # Old format: prepend full metadata object
-                        existing["allComposers"] = [new_entry] + existing["allComposers"]
-                    else:
-                        # New format: prepend ID to both ID lists
-                        existing.setdefault("selectedComposerIds", [])
-                        existing.setdefault("lastFocusedComposerIds", [])
-                        if composer_id not in existing["selectedComposerIds"]:
-                            existing["selectedComposerIds"] = [composer_id] + existing["selectedComposerIds"]
-                        if composer_id not in existing["lastFocusedComposerIds"]:
-                            existing["lastFocusedComposerIds"] = [composer_id] + existing["lastFocusedComposerIds"]
+                    # Always update allComposers — Cursor uses this list for the
+                    # sidebar regardless of whether hasMigratedComposerData is set.
+                    existing.setdefault("allComposers", [])
+                    existing["allComposers"] = [new_entry] + existing["allComposers"]
+                    # Also update the ID-only lists used by migrated workspaces.
+                    existing.setdefault("selectedComposerIds", [])
+                    existing.setdefault("lastFocusedComposerIds", [])
+                    if composer_id not in existing["selectedComposerIds"]:
+                        existing["selectedComposerIds"] = [composer_id] + existing["selectedComposerIds"]
+                    if composer_id not in existing["lastFocusedComposerIds"]:
+                        existing["lastFocusedComposerIds"] = [composer_id] + existing["lastFocusedComposerIds"]
                     ws_con.execute(
                         "INSERT OR REPLACE INTO ItemTable (key, value) VALUES (?, ?)",
                         ("composer.composerData", json.dumps(existing)),
                     )
             finally:
                 ws_con.close()
+
+            # Update global composer.composerHeaders so Cursor's sidebar
+            # immediately reflects the new conversation.
+            ws_json = ws_dir / "workspace.json"
+            try:
+                ws_json_data = json.loads(ws_json.read_text(encoding="utf-8"))
+                folder_uri = ws_json_data.get("folder", "")
+            except Exception:
+                folder_uri = ""
+            workspace_identifier = {
+                "id": ws_dir.name,
+                "uri": {
+                    "$mid": 1,
+                    "fsPath": str(project_path).replace("/", "\\"),
+                    "_sep": 1,
+                    "external": folder_uri,
+                    "path": "/" + str(project_path).replace("\\", "/").lstrip("/"),
+                    "scheme": "file",
+                },
+            }
+            global_header_entry = {**new_entry, "workspaceIdentifier": workspace_identifier}
+            gh_con = sqlite3.connect(str(global_db))
+            try:
+                with gh_con:
+                    gh_row = gh_con.execute(
+                        "SELECT value FROM ItemTable WHERE key = 'composer.composerHeaders'"
+                    ).fetchone()
+                    gh_data = json.loads(gh_row[0]) if (gh_row and gh_row[0]) else {"allComposers": []}
+                    gh_data.setdefault("allComposers", [])
+                    # Remove stale entry for this ID if present, then prepend.
+                    gh_data["allComposers"] = [
+                        c for c in gh_data["allComposers"] if c.get("composerId") != composer_id
+                    ]
+                    gh_data["allComposers"] = [global_header_entry] + gh_data["allComposers"]
+                    gh_con.execute(
+                        "INSERT OR REPLACE INTO ItemTable (key, value) VALUES (?, ?)",
+                        ("composer.composerHeaders", json.dumps(gh_data)),
+                    )
+            finally:
+                gh_con.close()
 
         finally:
             con.close()
@@ -990,21 +1097,40 @@ class CursorAdapter(ToolAdapter):
                 if not row or not row[0]:
                     return
                 existing = json.loads(row[0])
-                if "allComposers" in existing:
-                    existing["allComposers"] = [
-                        c for c in existing["allComposers"]
-                        if c.get("composerId") != conv_id
-                    ]
-                else:
-                    existing["selectedComposerIds"] = [
-                        x for x in existing.get("selectedComposerIds", []) if x != conv_id
-                    ]
-                    existing["lastFocusedComposerIds"] = [
-                        x for x in existing.get("lastFocusedComposerIds", []) if x != conv_id
-                    ]
+                existing["allComposers"] = [
+                    c for c in existing.get("allComposers", [])
+                    if c.get("composerId") != conv_id
+                ]
+                existing["selectedComposerIds"] = [
+                    x for x in existing.get("selectedComposerIds", []) if x != conv_id
+                ]
+                existing["lastFocusedComposerIds"] = [
+                    x for x in existing.get("lastFocusedComposerIds", []) if x != conv_id
+                ]
                 ws_con.execute(
                     "INSERT OR REPLACE INTO ItemTable (key, value) VALUES (?, ?)",
                     ("composer.composerData", json.dumps(existing)),
                 )
         finally:
             ws_con.close()
+
+        # Remove from global composer.composerHeaders so Cursor's sidebar
+        # reflects the deletion immediately.
+        gh_con = sqlite3.connect(str(global_db))
+        try:
+            with gh_con:
+                gh_row = gh_con.execute(
+                    "SELECT value FROM ItemTable WHERE key = 'composer.composerHeaders'"
+                ).fetchone()
+                if gh_row and gh_row[0]:
+                    gh_data = json.loads(gh_row[0])
+                    gh_data["allComposers"] = [
+                        c for c in gh_data.get("allComposers", [])
+                        if c.get("composerId") != conv_id
+                    ]
+                    gh_con.execute(
+                        "INSERT OR REPLACE INTO ItemTable (key, value) VALUES (?, ?)",
+                        ("composer.composerHeaders", json.dumps(gh_data)),
+                    )
+        finally:
+            gh_con.close()

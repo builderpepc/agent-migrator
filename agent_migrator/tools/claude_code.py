@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import difflib
 import json
 import os
 import re
@@ -238,6 +239,49 @@ def _count_message_lines(path: Path) -> int:
     return count
 
 
+def _structured_patch(old_string: str, new_string: str) -> list[dict]:
+    """
+    Compute a structuredPatch list in the format CC uses for Edit toolUseResult.
+    Each hunk: {oldStart, oldLines, newStart, newLines, lines: ["-old", "+new", " ctx"]}
+    """
+    old_lines = old_string.splitlines()
+    new_lines = new_string.splitlines()
+    matcher = difflib.SequenceMatcher(None, old_lines, new_lines, autojunk=False)
+    hunks = []
+    for group in matcher.get_grouped_opcodes(3):
+        old_start = group[0][1] + 1  # 1-based
+        new_start = group[0][3] + 1
+        old_count = 0
+        new_count = 0
+        lines: list[str] = []
+        for op, i1, i2, j1, j2 in group:
+            if op == "equal":
+                for line in old_lines[i1:i2]:
+                    lines.append(f" {line}")
+                old_count += i2 - i1
+                new_count += i2 - i1
+            elif op in ("delete", "replace"):
+                for line in old_lines[i1:i2]:
+                    lines.append(f"-{line}")
+                old_count += i2 - i1
+                if op == "replace":
+                    for line in new_lines[j1:j2]:
+                        lines.append(f"+{line}")
+                    new_count += j2 - j1
+            elif op == "insert":
+                for line in new_lines[j1:j2]:
+                    lines.append(f"+{line}")
+                new_count += j2 - j1
+        hunks.append({
+            "oldStart": old_start,
+            "oldLines": old_count,
+            "newStart": new_start,
+            "newLines": new_count,
+            "lines": lines,
+        })
+    return hunks
+
+
 class ClaudeCodeAdapter(ToolAdapter):
     name = "Claude Code"
     tool_id = "claude_code"
@@ -432,6 +476,30 @@ class ClaudeCodeAdapter(ToolAdapter):
                     # mismatched tool_use/tool_result counts → API 400.
                     return f"msg_{uuid.uuid4().hex[:20]}"
 
+                def _tool_use_result(tc: "ToolCallMessage") -> dict | None:
+                    """Build a toolUseResult metadata block for file-writing tools."""
+                    if tc.name == "Write":
+                        return {
+                            "type": "create",
+                            "filePath": tc.input.get("file_path", ""),
+                            "content": tc.input.get("content", ""),
+                            "structuredPatch": [],
+                            "originalFile": None,
+                        }
+                    if tc.name == "Edit":
+                        old_str = tc.input.get("old_string", "")
+                        new_str = tc.input.get("new_string", "")
+                        return {
+                            "filePath": tc.input.get("file_path", ""),
+                            "oldString": old_str,
+                            "newString": new_str,
+                            "originalFile": old_str,
+                            "structuredPatch": _structured_patch(old_str, new_str),
+                            "userModified": False,
+                            "replaceAll": tc.input.get("replace_all", False),
+                        }
+                    return None
+
                 def _write_tool_batch(
                     tool_batch: list[tuple[str, "ToolCallMessage"]],
                     ts: str,
@@ -456,22 +524,26 @@ class ClaudeCodeAdapter(ToolAdapter):
                     f.write(json.dumps(asst_record) + "\n")
                     prev_uuid = asst_uuid
 
-                    # One user record with all tool_result blocks
-                    result_uuid = str(uuid.uuid4())
-                    result_record = _make_base("user", result_uuid, ts)
-                    result_record["message"] = {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "tool_result",
-                                "tool_use_id": tool_use_id,
-                                "content": [{"type": "text", "text": tc.result}],
-                            }
-                            for tool_use_id, tc in tool_batch
-                        ],
-                    }
-                    f.write(json.dumps(result_record) + "\n")
-                    prev_uuid = result_uuid
+                    # One user record per tool_result (matches native CC format)
+                    for tool_use_id, tc in tool_batch:
+                        result_uuid = str(uuid.uuid4())
+                        result_record = _make_base("user", result_uuid, ts)
+                        result_record["message"] = {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "tool_result",
+                                    "tool_use_id": tool_use_id,
+                                    "content": tc.result,
+                                }
+                            ],
+                        }
+                        result_record["sourceToolAssistantUUID"] = asst_uuid
+                        tur = _tool_use_result(tc)
+                        if tur is not None:
+                            result_record["toolUseResult"] = tur
+                        f.write(json.dumps(result_record) + "\n")
+                        prev_uuid = result_uuid
 
                 turns = conv.turns
                 i = 0
@@ -516,21 +588,25 @@ class ClaudeCodeAdapter(ToolAdapter):
                         prev_uuid = asst_uuid
 
                         if tool_batch:
-                            result_uuid = str(uuid.uuid4())
-                            result_record = _make_base("user", result_uuid, ts)
-                            result_record["message"] = {
-                                "role": "user",
-                                "content": [
-                                    {
-                                        "type": "tool_result",
-                                        "tool_use_id": tuid,
-                                        "content": [{"type": "text", "text": tc.result}],
-                                    }
-                                    for tuid, tc in tool_batch
-                                ],
-                            }
-                            f.write(json.dumps(result_record) + "\n")
-                            prev_uuid = result_uuid
+                            for tuid, tc in tool_batch:
+                                result_uuid = str(uuid.uuid4())
+                                result_record = _make_base("user", result_uuid, ts)
+                                result_record["message"] = {
+                                    "role": "user",
+                                    "content": [
+                                        {
+                                            "type": "tool_result",
+                                            "tool_use_id": tuid,
+                                            "content": tc.result,
+                                        }
+                                    ],
+                                }
+                                result_record["sourceToolAssistantUUID"] = asst_uuid
+                                tur = _tool_use_result(tc)
+                                if tur is not None:
+                                    result_record["toolUseResult"] = tur
+                                f.write(json.dumps(result_record) + "\n")
+                                prev_uuid = result_uuid
 
                     else:
                         # ToolCallMessage not preceded by assistant text — collect the
