@@ -25,6 +25,189 @@ _TYPE_ASSISTANT = 2
 _CAPABILITY_TOOL = 15
 _CAPABILITY_SKIP = {22, 30}  # internal/streaming placeholders
 
+# Map Claude Code tool names to Cursor equivalents (name, numeric tool ID).
+# Cursor's UI only renders tool bubbles for known numeric IDs; tool=0 is invisible.
+_CC_TOOL_MAP: dict[str, tuple[str, int]] = {
+    "Read":         ("read_file_v2",       40),
+    "Edit":         ("search_replace",     38),
+    "Write":        ("write",              38),
+    "MultiEdit":    ("search_replace",    38),
+    "Bash":         ("run_terminal_cmd",   15),
+    "Glob":         ("glob_file_search",   42),
+    "Grep":         ("ripgrep_raw_search", 41),
+    "WebFetch":     ("web_fetch",          57),
+    "WebSearch":    ("web_search",         18),
+    "NotebookRead": ("read_file_v2",       40),
+    "NotebookEdit": ("edit_file_v2",       38),
+    "TodoWrite":    ("todo_write",         35),
+    "TodoRead":     ("read_file_v2",       40),
+}
+
+
+def _file_uri(file_path: str) -> dict:
+    """Build a VS Code URI object for a file path (used in codeBlocks)."""
+    # Normalise to forward slashes
+    fwd = file_path.replace("\\", "/")
+    # VS Code path: leading slash on Windows (e.g. /c:/Users/...)
+    vsc_path = fwd if fwd.startswith("/") else f"/{fwd}"
+    # URL-encoded form: colon → %3A
+    encoded = vsc_path.replace(":", "%3A")
+    # Windows fs path uses backslashes; strip the leading / we added
+    fs_path = fwd.lstrip("/").replace("/", "\\") if "\\" in file_path or ":" in file_path else None
+    return {
+        "scheme": "file",
+        "authority": "",
+        "path": vsc_path,
+        "query": "",
+        "fragment": "",
+        "_formatted": f"file://{encoded}",
+        "_fsPath": fs_path or fwd,
+    }
+
+
+def _adapt_cc_tool(
+    turn: "ToolCallMessage", project_path: Path
+) -> tuple[str, int, str, str, list]:
+    """
+    Map a Claude Code ToolCallMessage to Cursor's toolFormerData fields.
+    Returns (cursor_tool_name, cursor_tool_num, params_json, result_json, code_blocks).
+
+    code_blocks populates the bubble's top-level codeBlocks field, which is what
+    Cursor's renderer reads to display file content and diffs inline.
+    """
+    name = turn.name
+    inp = turn.input or {}
+    raw_result = turn.result or ""
+
+    # MCP tools (e.g. mcp_perplexity_perplexity_ask) → Cursor MCP type
+    if name.startswith("mcp_"):
+        return name, 19, json.dumps(inp), raw_result, []
+
+    cursor_name, tool_num = _CC_TOOL_MAP.get(name, (name, 0))
+    code_blocks: list = []
+
+    # Build Cursor-format params, result, and codeBlocks based on tool type.
+    if name == "Read":
+        file_path = inp.get("file_path", "")
+        params = {"targetFile": file_path}
+        result = json.dumps({"contents": raw_result})
+        # codeBlocks lets Cursor render the file content inline
+        if file_path:
+            cb_id = str(uuid.uuid4())
+            code_blocks = [{
+                "uri": _file_uri(file_path),
+                "codeblockId": cb_id,
+                "codeBlockIdx": 0,
+                "content": raw_result,
+            }]
+    elif name == "Edit":
+        file_path = inp.get("file_path", "")
+        params = {"relativeWorkspacePath": file_path}
+        old_str = inp.get("old_string", "")
+        new_str = inp.get("new_string", "")
+        diff_lines = [f"- {l}" for l in old_str.splitlines()] + \
+                     [f"+ {l}" for l in new_str.splitlines()]
+        result = json.dumps({
+            "diff": {"chunks": [{"diffString": "\r\n".join(diff_lines)}]},
+            "shouldAutoFixLints": False,
+            "resultForModel": "Applied edit.",
+        })
+        if file_path:
+            cb_id = str(uuid.uuid4())
+            code_blocks = [{
+                "uri": _file_uri(file_path),
+                "codeblockId": cb_id,
+                "codeBlockIdx": 0,
+                "content": new_str,
+            }]
+    elif name == "MultiEdit":
+        file_path = inp.get("file_path", "")
+        params = {"relativeWorkspacePath": file_path}
+        chunks = []
+        all_new = []
+        for edit in inp.get("edits", []):
+            old_str = edit.get("old_string", "")
+            new_str = edit.get("new_string", "")
+            diff_lines = [f"- {l}" for l in old_str.splitlines()] + \
+                         [f"+ {l}" for l in new_str.splitlines()]
+            chunks.append({"diffString": "\r\n".join(diff_lines)})
+            all_new.append(new_str)
+        result = json.dumps({
+            "diff": {"chunks": chunks},
+            "shouldAutoFixLints": False,
+            "resultForModel": "Applied edits.",
+        })
+        if file_path:
+            cb_id = str(uuid.uuid4())
+            code_blocks = [{
+                "uri": _file_uri(file_path),
+                "codeblockId": cb_id,
+                "codeBlockIdx": 0,
+                "content": "\n".join(all_new),
+            }]
+    elif name == "Write":
+        file_path = inp.get("file_path", "")
+        content = inp.get("content", "")
+        params = {"relativeWorkspacePath": file_path}
+        diff_lines = ["- "] + [f"+ {l}" for l in content.splitlines()]
+        result = json.dumps({
+            "diff": {"chunks": [{"diffString": "\r\n".join(diff_lines)}]},
+            "shouldAutoFixLints": False,
+            "resultForModel": "Created file.",
+        })
+        if file_path:
+            cb_id = str(uuid.uuid4())
+            code_blocks = [{
+                "uri": _file_uri(file_path),
+                "codeblockId": cb_id,
+                "codeBlockIdx": 0,
+                "content": content,
+            }]
+    elif name == "Bash":
+        cmd = inp.get("command", "")
+        params = {"command": cmd, "requireUserApproval": False}
+        result = json.dumps({"output": raw_result})
+    elif name == "Glob":
+        params = {
+            "globPattern": inp.get("pattern", ""),
+            "targetDirectory": str(project_path),
+        }
+        result = json.dumps({"files": raw_result})
+    elif name == "Grep":
+        params = {
+            "pattern": inp.get("pattern", ""),
+            "path": inp.get("path", str(project_path)),
+        }
+        result = json.dumps({"output": raw_result})
+    elif name == "WebFetch":
+        url = inp.get("url", "")
+        params = {"url": url}
+        result = json.dumps({"url": url, "markdown": raw_result})
+    elif name == "WebSearch":
+        params = {"searchTerm": inp.get("query", "")}
+        result = json.dumps({"references": raw_result})
+    elif name in ("NotebookRead", "TodoRead"):
+        file_path = inp.get("notebook_path", inp.get("file_path", ""))
+        params = {"targetFile": file_path}
+        result = json.dumps({"contents": raw_result})
+        if file_path:
+            cb_id = str(uuid.uuid4())
+            code_blocks = [{
+                "uri": _file_uri(file_path),
+                "codeblockId": cb_id,
+                "codeBlockIdx": 0,
+                "content": raw_result,
+            }]
+    elif name in ("NotebookEdit", "TodoWrite"):
+        file_path = inp.get("notebook_path", inp.get("file_path", ""))
+        params = {"relativeWorkspacePath": file_path}
+        result = json.dumps({"success": True})
+    else:
+        params = inp
+        result = raw_result
+
+    return cursor_name, tool_num, json.dumps(params), result, code_blocks
+
 
 def _global_db_path() -> Path:
     system = platform.system()
@@ -466,24 +649,32 @@ class CursorAdapter(ToolAdapter):
                         # ToolCallMessage → capabilityType 15 bubble
                         conversation_items.append({"bubbleId": bubble_id, "type": _TYPE_ASSISTANT})
                         tool_call_id = f"toolu_{uuid.uuid4().hex[:24]}"
-                        result_str = turn.result if isinstance(turn.result, str) else json.dumps(turn.result)
+                        cursor_name, tool_num, params_str, result_str, code_blocks = _adapt_cc_tool(
+                            turn, project_path
+                        )
                         bubble = _make_bubble_base(bubble_id, _TYPE_ASSISTANT, ts_iso)
                         bubble["capabilityType"] = _CAPABILITY_TOOL
-                        bubble["codeBlocks"] = []
+                        bubble["codeBlocks"] = code_blocks
                         bubble["attachedHumanChanges"] = False
                         bubble["usageUuid"] = last_user_request_id
                         bubble["symbolLinks"] = []
                         bubble["fileLinks"] = []
+                        # additionalData carries the codeblockId so the renderer can
+                        # cross-reference codeBlocks entries by ID.
+                        additional_data: dict = {}
+                        if code_blocks:
+                            additional_data["codeblockId"] = code_blocks[0]["codeblockId"]
                         bubble["toolFormerData"] = {
                             "toolCallId": tool_call_id,
                             "toolIndex": 0,
                             "modelCallId": tool_call_id,
                             "status": "completed",
-                            "name": turn.name,
+                            "name": cursor_name,
                             "rawArgs": json.dumps(turn.input),
-                            "tool": 0,
-                            "params": json.dumps(turn.input),
+                            "tool": tool_num,
+                            "params": params_str,
                             "result": result_str,
+                            "additionalData": additional_data,
                         }
 
                     con.execute(
