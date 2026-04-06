@@ -1065,6 +1065,21 @@ class CursorAdapter(ToolAdapter):
                         (f"bubbleId:{composer_id}:{bubble_id}", json.dumps(bubble)),
                     )
 
+                    # Write a messageRequestContext record for every user bubble.
+                    # Cursor requires this key (keyed by requestId) to include the
+                    # turn in the agent's conversation context.
+                    if isinstance(turn, TextMessage) and turn.role == "user":
+                        msg_ctx = {
+                            "terminalFiles": [],
+                            "cursorRules": [],
+                            "attachedFoldersListDirResults": [],
+                            "summarizedComposers": [],
+                        }
+                        con.execute(
+                            "INSERT OR REPLACE INTO cursorDiskKV (key, value) VALUES (?, ?)",
+                            (f"messageRequestContext:{composer_id}:{request_id}", json.dumps(msg_ctx)),
+                        )
+
                 # Generate a random encryption key for speculative summarization.
                 # Cursor uses this to encrypt summarization data for this conversation.
                 # A fresh random key allows new messages to be sent normally.
