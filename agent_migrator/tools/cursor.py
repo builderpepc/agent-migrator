@@ -972,6 +972,9 @@ class CursorAdapter(ToolAdapter):
                 last_checkpoint_id = ""
                 first_todo_bubble_id = ""
                 plan_todos: list = []
+                # Track whether the next assistant text bubble is the direct
+                # response to the most recent user message (needs requestId set).
+                pending_asst_request_id = ""
 
                 for turn in conv.turns:
                     bubble_id = str(uuid.uuid4())
@@ -987,36 +990,41 @@ class CursorAdapter(ToolAdapter):
                         conversation_items.append({"bubbleId": bubble_id, "type": btype})
                         bubble = _make_bubble_base(bubble_id, btype, ts_iso)
                         bubble["text"] = turn.text
+                        bubble["isAgentic"] = is_agentic
 
                         if turn.role == "user":
                             request_id = str(uuid.uuid4())
                             checkpoint_id = str(uuid.uuid4())
                             last_user_request_id = request_id
                             last_checkpoint_id = checkpoint_id
+                            pending_asst_request_id = request_id
                             bubble["requestId"] = request_id
                             bubble["checkpointId"] = checkpoint_id
                             bubble["richText"] = ""
-                            bubble["cursorCommands"] = []
-                            bubble["cursorCommandsExplicitlySet"] = False
-                            bubble["pastChats"] = []
-                            bubble["pastChatsExplicitlySet"] = False
                             bubble["context"] = _BUBBLE_CONTEXT
                             bubble["modelInfo"] = {"modelName": ""}
                             bubble["isPlanExecution"] = False
                             bubble["isNudge"] = False
                             bubble["skipRendering"] = False
                             bubble["editToolSupportsSearchAndReplace"] = True
-                            bubble["workspaceProjectDir"] = ""
-                            bubble["toolFormerData"] = {"additionalData": {}}
                         else:
                             # Assistant text bubbles
                             bubble["codeBlocks"] = []
                             bubble["attachedHumanChanges"] = False
                             bubble["usageUuid"] = last_user_request_id
-                            bubble["symbolLinks"] = []
-                            bubble["fileLinks"] = []
+                            bubble["modelInfo"] = {"modelName": ""}
+                            bubble["timingInfo"] = {}
+                            # First assistant response to a user message shares the
+                            # user's requestId — Cursor uses this to group turns.
+                            if pending_asst_request_id:
+                                bubble["requestId"] = pending_asst_request_id
+                                pending_asst_request_id = ""
                     else:
-                        # ToolCallMessage → capabilityType 15 bubble
+                        # ToolCallMessage → capabilityType 15 bubble.
+                        # Tool bubbles have neither requestId nor usageUuid set
+                        # (both stay as "" from _make_bubble_base) — matching
+                        # native Cursor's pattern.
+                        pending_asst_request_id = ""
                         conversation_items.append({"bubbleId": bubble_id, "type": _TYPE_ASSISTANT})
                         tool_call_id = f"toolu_{uuid.uuid4().hex[:24]}"
                         cursor_name, tool_num, params_str, result_str, code_blocks, extra_fields = _adapt_cc_tool(
@@ -1026,9 +1034,7 @@ class CursorAdapter(ToolAdapter):
                         bubble["capabilityType"] = _CAPABILITY_TOOL
                         bubble["codeBlocks"] = code_blocks
                         bubble["attachedHumanChanges"] = False
-                        bubble["usageUuid"] = last_user_request_id
-                        bubble["symbolLinks"] = []
-                        bubble["fileLinks"] = []
+                        bubble["isAgentic"] = is_agentic
                         # additionalData carries the codeblockId so the renderer can
                         # cross-reference codeBlocks entries by ID.
                         additional_data: dict = {}
