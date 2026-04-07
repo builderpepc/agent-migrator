@@ -39,6 +39,8 @@ MessageTurn = Union[TextMessage, ToolCallMessage]
 class Conversation:
     info: ConversationInfo
     turns: list[MessageTurn] = field(default_factory=list)
+    plan_content: str | None = None  # raw markdown plan text (no YAML frontmatter)
+    model: str | None = None          # API model ID used (e.g. "claude-sonnet-4-6")
 
 
 @dataclass

@@ -47,6 +47,30 @@ The tool will launch an interactive TUI that walks you through:
 
 ---
 
+## What gets migrated
+
+### Cursor → Claude Code
+
+| Feature | Status |
+|---|---|
+| Text messages (user and assistant) | ✓ |
+| Tool calls (Read, Write, Edit, Bash, Glob, Grep, WebFetch, WebSearch) | ✓ |
+| Bash mode commands and output | ✓ |
+| Plan (most recent plan associated with the conversation) | ✓ |
+
+### Claude Code → Cursor
+
+| Feature | Status |
+|---|---|
+| Text messages (user and assistant) | ✓ |
+| Tool calls (Read, Write, Edit, Bash, Glob, Grep, WebFetch, WebSearch, MCP) | ✓ |
+| Bash mode commands and output | ✓ |
+| Plan document and todos | ✓ |
+| Plan mode integration (Cursor treats conversation as having an active plan) | Partial — the plan is written as a markdown document that the Cursor agent can read, but Cursor does not treat it as a native plan |
+| Agent conversation history (Cursor agent sees full prior context when resuming) | ✓ |
+
+---
+
 ## How it works
 
 ### Storage formats
@@ -55,7 +79,7 @@ The tool will launch an interactive TUI that walks you through:
 - Windows: `%APPDATA%\Cursor\User\globalStorage\state.vscdb`
 - macOS: `~/Library/Application Support/Cursor/User/globalStorage/state.vscdb`
 
-Each conversation is a `composerData:<id>` record listing the ordered bubble IDs. Individual messages are stored as `bubbleId:<composerId>:<bubbleId>` records. Tool calls (file edits, terminal commands, searches) are stored as separate bubbles with a `capabilityType: 15` marker and a `toolFormerData` object containing the call and its result.
+Each conversation is a `composerData:<id>` record containing the ordered list of bubble IDs and a `conversationState` field that encodes message history as a protobuf of content-addressed blob hashes. Individual messages are stored as `bubbleId:<composerId>:<bubbleId>` records (used for UI rendering) and as `agentKv:blob:<sha256>` records (used by the agent backend to reconstruct history for API calls). Tool calls are stored as separate bubbles with a `capabilityType: 15` marker and a `toolFormerData` object.
 
 To associate a conversation with a project, Cursor writes a `workspace.json` file in a per-workspace directory under `workspaceStorage/`. The tool uses this to find which conversations belong to a given path.
 
@@ -68,8 +92,9 @@ The path encoding replaces path separators and colons with dashes (e.g. `C:/User
 
 Conversations are read into a tool-agnostic normalized format (`TextMessage` and `ToolCallMessage` turns), then written out in the destination format:
 
-- **Cursor to Claude Code:** Each Cursor tool bubble (`capabilityType: 15`) is split into a `tool_use` assistant record and a `tool_result` user record. Text bubbles become plain `user`/`assistant` records.
-- **Claude Code to Cursor:** Paired `tool_use`/`tool_result` records are merged into a single `capabilityType: 15` bubble. Text records become type-1 (user) or type-2 (assistant) bubbles.
+- **Cursor → Claude Code:** Each Cursor tool bubble (`capabilityType: 15`) is split into a `tool_use` assistant record and a `tool_result` user record. Text bubbles become plain `user`/`assistant` records. Plans are read from Cursor's plan registry and written as markdown files in `~/.claude/plans/`.
+
+- **Claude Code → Cursor:** Paired `tool_use`/`tool_result` records are merged into a single `capabilityType: 15` bubble. Text records become type-1 (user) or type-2 (assistant) bubbles. Additionally, the full conversation is encoded into Cursor's `agentKv:blob` content-addressed store so the Cursor agent has complete prior context when you send your next message. Plans are converted to Cursor's YAML-frontmatter format and registered in the global plan registry. The `conversationMap` in `composerData` is pre-populated with all bubbles so Cursor renders the conversation immediately without a separate loading step.
 
 Writes are atomic: Claude Code sessions are written to a `.tmp` file and renamed on success; Cursor writes use a SQLite transaction. If anything fails or the user cancels, the partial output is deleted.
 

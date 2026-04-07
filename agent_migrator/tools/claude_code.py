@@ -29,6 +29,10 @@ def _projects_dir() -> Path:
     return _claude_dir() / "projects"
 
 
+def _cc_plans_dir() -> Path:
+    return _claude_dir() / "plans"
+
+
 def encode_project_path(project_path: Path) -> str:
     """
     Encode an absolute project path to Claude Code's folder-name format.
@@ -470,7 +474,39 @@ class ClaudeCodeAdapter(ToolAdapter):
             size_bytes=jsonl_file.stat().st_size,
             source_tool=self.tool_id,
         )
-        return Conversation(info=info, turns=turns)
+
+        # Read associated plan: check the plan file first (most up-to-date),
+        # then fall back to the ExitPlanMode tool_use embedded in the transcript.
+        plan_content: str | None = None
+        slug = _extract_json_string_field(jsonl_file.read_text(encoding="utf-8", errors="replace"), "slug")
+        if slug:
+            plan_file = _cc_plans_dir() / f"{slug}.md"
+            if plan_file.exists():
+                plan_content = plan_file.read_text(encoding="utf-8").strip() or None
+        if plan_content is None:
+            for turn in turns:
+                if (
+                    isinstance(turn, ToolCallMessage)
+                    and turn.name in ("ExitPlanMode", "ExitPlanModeV2", "exit-plan-mode-v2")
+                    and turn.input.get("plan")
+                ):
+                    plan_content = turn.input["plan"].strip() or None
+                    break
+
+        # Extract the API model ID from the first assistant record.
+        model: str | None = None
+        for line in jsonl_file.read_text(encoding="utf-8", errors="replace").splitlines():
+            try:
+                rec = json.loads(line)
+            except Exception:
+                continue
+            if rec.get("type") == "assistant":
+                m = rec.get("message", {}).get("model", "")
+                if m and m != "<synthetic>":
+                    model = m
+                    break
+
+        return Conversation(info=info, turns=turns, plan_content=plan_content, model=model)
 
     def write_conversation(self, conv: Conversation, project_path: Path) -> str:
         encoded = encode_project_path(project_path.resolve())
@@ -481,8 +517,11 @@ class ClaudeCodeAdapter(ToolAdapter):
         final_path = session_dir / f"{session_id}.jsonl"
         tmp_path = session_dir / f"{session_id}.jsonl.tmp"
 
-        # Pick a slug: use source slug or derive from name
-        slug = re.sub(r"[^a-z0-9]+", "-", conv.info.name.lower()).strip("-") or session_id[:8]
+        # Pick a slug: use source slug or derive from name.
+        # Append a random suffix so migrated plan files don't collide with
+        # existing plans that share the same conversation name.
+        slug_base = re.sub(r"[^a-z0-9]+", "-", conv.info.name.lower()).strip("-") or session_id[:8]
+        slug = f"{slug_base}-{uuid.uuid4().hex[:8]}"
 
         try:
             with open(tmp_path, "w", encoding="utf-8") as f:
@@ -660,6 +699,15 @@ class ClaudeCodeAdapter(ToolAdapter):
             if tmp_path.exists():
                 tmp_path.unlink()
             raise
+
+        # Write associated plan file if the conversation carried one.
+        # CC finds plans by looking for ~/.claude/plans/{slug}.md — writing
+        # it here is enough for the session to show the plan on next open.
+        if conv.plan_content:
+            plans_dir = _cc_plans_dir()
+            plans_dir.mkdir(parents=True, exist_ok=True)
+            plan_path = plans_dir / f"{slug}.md"
+            plan_path.write_text(conv.plan_content, encoding="utf-8")
 
         return session_id
 
