@@ -117,17 +117,70 @@ def main() -> None:
     engine = MigrationEngine()
     results = MigrationResult()
 
+    # Track whether the user has already chosen to use the local fallback backend
+    # for all remaining conversations (so we don't ask repeatedly).
+    use_local_fallback = False
+    use_local_fallback_decided = False
+
     try:
         for idx, conv_info in enumerate(selected_convs, 1):
             label = f"  [{idx}/{len(selected_convs)}] {conv_info.name[:50]}"
             console.print(f"{label} ...", end="")
             try:
-                new_id = engine.migrate_one(src, dst, conv_info, project_path, lambda _: None)
+                if use_local_fallback:
+                    # User already chose fallback for remaining conversations.
+                    conv = src.read_conversation(conv_info.id, project_path)
+                    new_id = dst.write_conversation(conv, project_path, use_local_backend=True)
+                else:
+                    new_id = engine.migrate_one(src, dst, conv_info, project_path, lambda _: None)
                 results.succeeded.append((conv_info, new_id))
                 console.print(" [green]done[/green]")
             except Exception as e:
-                results.failed.append((conv_info, str(e)))
-                console.print(f" [red]failed: {e}[/red]")
+                # Check if this is a server upload failure that can fall back.
+                from agent_migrator.tools.cursor import ServerUploadError
+                if isinstance(e, ServerUploadError) and not use_local_fallback_decided:
+                    use_local_fallback_decided = True
+                    console.print(f" [yellow]server upload failed[/yellow]")
+                    console.print(
+                        f"\n  [yellow]Could not upload conversation history to Cursor's server:[/yellow]"
+                        f"\n  {e}"
+                        f"\n\n  The fallback uses Cursor's local agent backend, which provides full"
+                        f"\n  conversation context but restricts model selection to Anthropic models"
+                        f"\n  (Sonnet/Opus) for migrated conversations.\n"
+                    )
+                    fallback = questionary.confirm(
+                        "Use local fallback backend for this and remaining conversations?",
+                        default=True,
+                    ).ask()
+                    if fallback:
+                        use_local_fallback = True
+                        # Retry this conversation with the fallback.
+                        try:
+                            conv = src.read_conversation(conv_info.id, project_path)
+                            new_id = dst.write_conversation(conv, project_path, use_local_backend=True)
+                            results.succeeded.append((conv_info, new_id))
+                            console.print(f"  {label} ... [green]done (local backend)[/green]")
+                            continue
+                        except Exception as e2:
+                            results.failed.append((conv_info, str(e2)))
+                            console.print(f"  {label} ... [red]failed: {e2}[/red]")
+                            continue
+                    else:
+                        results.failed.append((conv_info, str(e)))
+                elif isinstance(e, ServerUploadError) and use_local_fallback:
+                    # Already decided to use fallback — retry silently.
+                    try:
+                        conv = src.read_conversation(conv_info.id, project_path)
+                        new_id = dst.write_conversation(conv, project_path, use_local_backend=True)
+                        results.succeeded.append((conv_info, new_id))
+                        console.print(" [green]done (local backend)[/green]")
+                        continue
+                    except Exception as e2:
+                        results.failed.append((conv_info, str(e2)))
+                        console.print(f" [red]failed: {e2}[/red]")
+                else:
+                    results.failed.append((conv_info, str(e)))
+                    console.print(f" [red]failed: {e}[/red]")
     except KeyboardInterrupt:
         console.print("\n[yellow]Cancelled.[/yellow]")
 

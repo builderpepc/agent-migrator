@@ -20,6 +20,10 @@ from agent_migrator.models import (
 )
 from agent_migrator.tools.base import ToolAdapter
 
+class ServerUploadError(RuntimeError):
+    """Raised when the ConvertOALToNAL server call fails (auth, network, etc.)."""
+
+
 # Numeric bubble type constants (Cursor internal schema v2)
 _TYPE_USER = 1
 _TYPE_ASSISTANT = 2
@@ -810,6 +814,115 @@ def _encode_cursor_projects_path(project_path: Path) -> str:
 
 
 
+def _encode_cursor_exp_path(project_path: Path) -> str:
+    """
+    Encode a project path for ~/.cursor-exp/projects/{encoded}/.
+
+    All non-alphanumeric characters are replaced by '-'.
+    If the result exceeds 200 chars, truncate and append a hash.
+    """
+    encoded = re.sub(r"[^a-zA-Z0-9]", "-", str(project_path))
+    if len(encoded) <= 200:
+        return encoded
+    h = 0
+    for c in str(project_path):
+        h = (h * 31 + ord(c)) & 0xFFFFFFFF
+    return f"{encoded[:200]}-{h:x}"
+
+
+def _write_cc_session_jsonl(
+    conv: "Conversation",
+    session_id: str,
+    project_path: Path,
+) -> None:
+    """
+    Write a Claude Code session JSONL file to
+    ``~/.cursor-exp/projects/{encodedPath}/{sessionId}.jsonl``.
+
+    Used as a fallback when the ConvertOALToNAL server call fails.
+    Cursor's ``"claude-code"`` agent backend spawns a Claude Code subprocess
+    that reads conversation history from these files.
+    """
+    encoded = _encode_cursor_exp_path(project_path)
+    session_dir = Path.home() / ".cursor-exp" / "projects" / encoded
+    session_dir.mkdir(parents=True, exist_ok=True)
+    session_file = session_dir / f"{session_id}.jsonl"
+
+    prev_uuid: str | None = None
+
+    def _make_base(rec_type: str, rec_uuid: str, ts: str) -> dict:
+        return {
+            "type": rec_type,
+            "uuid": rec_uuid,
+            "parentUuid": prev_uuid,
+            "sessionId": session_id,
+            "timestamp": ts,
+            "isSidechain": False,
+            "userType": "external",
+            "cwd": str(project_path),
+        }
+
+    def _msg_id() -> str:
+        return f"msg_{uuid.uuid4().hex[:20]}"
+
+    lines: list[str] = []
+
+    for turn in conv.turns:
+        ts = turn.timestamp.isoformat() if turn.timestamp else datetime.now(timezone.utc).isoformat()
+
+        if isinstance(turn, TextMessage) and turn.role == "user":
+            rec_uuid = str(uuid.uuid4())
+            record = _make_base("user", rec_uuid, ts)
+            record["message"] = {"role": "user", "content": turn.text}
+            lines.append(json.dumps(record, ensure_ascii=False))
+            prev_uuid = rec_uuid
+
+        elif isinstance(turn, TextMessage) and turn.role == "assistant":
+            rec_uuid = str(uuid.uuid4())
+            record = _make_base("assistant", rec_uuid, ts)
+            record["message"] = {
+                "id": _msg_id(),
+                "role": "assistant",
+                "content": [{"type": "text", "text": turn.text}],
+            }
+            lines.append(json.dumps(record, ensure_ascii=False))
+            prev_uuid = rec_uuid
+
+        elif isinstance(turn, ToolCallMessage):
+            tool_use_id = f"toolu_{uuid.uuid4().hex[:24]}"
+            asst_uuid = str(uuid.uuid4())
+            asst_record = _make_base("assistant", asst_uuid, ts)
+            asst_record["message"] = {
+                "id": _msg_id(),
+                "role": "assistant",
+                "content": [{
+                    "type": "tool_use",
+                    "id": tool_use_id,
+                    "name": turn.name,
+                    "input": turn.input or {},
+                }],
+            }
+            lines.append(json.dumps(asst_record, ensure_ascii=False))
+            prev_uuid = asst_uuid
+
+            result_uuid = str(uuid.uuid4())
+            result_record = _make_base("user", result_uuid, ts)
+            result_text = turn.result if isinstance(turn.result, str) else json.dumps(turn.result)
+            result_record["message"] = {
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": tool_use_id,
+                    "content": result_text,
+                }],
+            }
+            result_record["toolUseResult"] = {"type": "tool_result"}
+            lines.append(json.dumps(result_record, ensure_ascii=False))
+            prev_uuid = result_uuid
+
+    session_file.write_text("\n".join(lines), encoding="utf-8")
+
+
 def _now_ms() -> int:
     return int(datetime.now(timezone.utc).timestamp() * 1000)
 
@@ -1140,7 +1253,13 @@ class CursorAdapter(ToolAdapter):
         )
         return Conversation(info=info, turns=turns, plan_content=plan_content)
 
-    def write_conversation(self, conv: Conversation, project_path: Path) -> str:
+    def write_conversation(
+        self,
+        conv: Conversation,
+        project_path: Path,
+        *,
+        use_local_backend: bool = False,
+    ) -> str:
         ws_dir = _find_workspace_dir(project_path)
         if ws_dir is None:
             raise RuntimeError(
@@ -1420,23 +1539,50 @@ class CursorAdapter(ToolAdapter):
                         )
                         conversation_map[cap30_id] = cap30
 
-                # Upload conversation history via ConvertOALToNAL.
-                # This creates server-owned blobs so the regular "cursor-agent"
-                # backend has full prior context (all models available).
-                # Collect non-cap30 bubble IDs for the ConversationMessage protos.
-                turn_bubble_ids = [
-                    item["bubbleId"]
-                    for item in conversation_items
-                    if item["bubbleId"] not in {
-                        b_id for b_id, b in conversation_map.items()
-                        if b.get("capabilityType") == 30
+                # Choose agent backend path.
+                # Primary: ConvertOALToNAL uploads history to Cursor's server,
+                #   enabling the regular "cursor-agent" backend (all models).
+                # Fallback: "claude-code" backend writes a local session JSONL
+                #   (Anthropic models only, but works without auth/network).
+                if use_local_backend:
+                    # Fallback: write local session JSONL for "claude-code" backend.
+                    cc_session_id = str(uuid.uuid4())
+                    _write_cc_session_jsonl(conv, cc_session_id, project_path)
+                    last_user_bubble_id = ""
+                    for item in reversed(conversation_items):
+                        if item.get("type") == _TYPE_USER:
+                            last_user_bubble_id = item["bubbleId"]
+                            break
+                    agent_backend = "claude-code"
+                    agent_backend_data: dict | None = {
+                        "bubbleIdToSessionId": {
+                            last_user_bubble_id: cc_session_id,
+                        },
+                        "bubbleIdToRequestId": {
+                            last_user_bubble_id: last_user_request_id,
+                        },
                     }
-                ]
-                auth_token = _get_cursor_auth_token(_global_db_path())
-                nal_response = _convert_oal_to_nal(
-                    conv, composer_id, turn_bubble_ids, auth_token,
-                )
-                conversation_state = _store_nal_response(nal_response, con)
+                    conversation_state = ""
+                else:
+                    # Primary: upload via ConvertOALToNAL for server-owned blobs.
+                    turn_bubble_ids = [
+                        item["bubbleId"]
+                        for item in conversation_items
+                        if item["bubbleId"] not in {
+                            b_id for b_id, b in conversation_map.items()
+                            if b.get("capabilityType") == 30
+                        }
+                    ]
+                    try:
+                        auth_token = _get_cursor_auth_token(_global_db_path())
+                        nal_response = _convert_oal_to_nal(
+                            conv, composer_id, turn_bubble_ids, auth_token,
+                        )
+                        conversation_state = _store_nal_response(nal_response, con)
+                    except Exception as exc:
+                        raise ServerUploadError(str(exc)) from exc
+                    agent_backend = "cursor-agent"
+                    agent_backend_data = None
 
                 # Generate a random encryption key for speculative summarization.
                 # Cursor uses this to encrypt summarization data for this conversation.
@@ -1521,8 +1667,7 @@ class CursorAdapter(ToolAdapter):
                     "stopHookLoopCount": 0,
                     "speculativeSummarizationEncryptionKey": speculative_key,
                     "isNAL": True,
-                    "agentBackend": "cursor-agent",
-                    # conversationState from ConvertOALToNAL — server-owned blobs.
+                    "agentBackend": agent_backend,
                     "conversationState": conversation_state,
                     "planModeSuggestionUsed": False,
                     "latestChatGenerationUUID": last_user_request_id,
@@ -1532,6 +1677,8 @@ class CursorAdapter(ToolAdapter):
                     "todos": plan_todos,
                     "firstTodoWriteBubble": first_todo_bubble_id,
                 }
+                if agent_backend_data is not None:
+                    composer_data["agentBackendData"] = agent_backend_data
                 con.execute(
                     "INSERT OR REPLACE INTO cursorDiskKV (key, value) VALUES (?, ?)",
                     (f"composerData:{composer_id}", json.dumps(composer_data)),
