@@ -40,7 +40,9 @@ class ToolAdapter(ABC):
         """Load the full Conversation (all turns) for *conv_id*."""
 
     @abstractmethod
-    def write_conversation(self, conv: Conversation, project_path: Path) -> str:
+    def write_conversation(
+        self, conv: Conversation, project_path: Path, **kwargs
+    ) -> str:
         """
         Persist *conv* as a new conversation for *project_path*.
 

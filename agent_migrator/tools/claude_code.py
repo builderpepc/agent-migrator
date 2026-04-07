@@ -508,7 +508,7 @@ class ClaudeCodeAdapter(ToolAdapter):
 
         return Conversation(info=info, turns=turns, plan_content=plan_content, model=model)
 
-    def write_conversation(self, conv: Conversation, project_path: Path) -> str:
+    def write_conversation(self, conv: Conversation, project_path: Path, **kwargs) -> str:
         encoded = encode_project_path(project_path.resolve())
         session_dir = _projects_dir() / encoded
         session_dir.mkdir(parents=True, exist_ok=True)
