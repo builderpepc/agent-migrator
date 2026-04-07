@@ -214,245 +214,251 @@ def _pb_message(field_num: int, payload: bytes) -> bytes:
     return _pb_field(field_num, 2, _pb_varint(len(payload)) + payload)
 
 
-def _new_blob_id() -> bytes:
-    """Generate a random 32-byte blob ID (matches Cursor's random UUID-based IDs)."""
-    return uuid.uuid4().bytes + uuid.uuid4().bytes  # 32 bytes
+def _pb_enum(field_num: int, value: int) -> bytes:
+    """Encode a protobuf enum field (wire type 0 / varint)."""
+    return _pb_field(field_num, 0, _pb_varint(value))
 
 
-def _store_blob(con: "sqlite3.Connection", blob_id: bytes, data: bytes) -> None:
-    """Write a blob to agentKv:blob:{hex_id} in cursorDiskKV."""
-    con.execute(
-        "INSERT OR REPLACE INTO cursorDiskKV (key, value) VALUES (?, ?)",
-        (f"agentKv:blob:{blob_id.hex()}", data),
-    )
+def _pb_bool(field_num: int, value: bool) -> bytes:
+    """Encode a protobuf bool field (wire type 0 / varint)."""
+    return _pb_field(field_num, 0, _pb_varint(1 if value else 0))
 
 
-def _encode_tool_call_step(turn: "ToolCallMessage") -> bytes:
+# ---------------------------------------------------------------------------
+# ConvertOALToNAL — upload conversation history via Cursor's server API
+# ---------------------------------------------------------------------------
+
+_CONVERT_URL = "https://api2.cursor.sh/aiserver.v1.ChatService/ConvertOALToNAL"
+
+
+def _get_cursor_auth_token(global_db: Path) -> str:
+    """Read the Cursor auth token from state.vscdb ItemTable."""
+    con = sqlite3.connect(str(global_db), timeout=10)
+    try:
+        row = con.execute(
+            "SELECT value FROM ItemTable WHERE key = 'cursorAuth/accessToken'"
+        ).fetchone()
+        if not row or not row[0]:
+            raise RuntimeError(
+                "No Cursor auth token found. Please log in to Cursor first."
+            )
+        return row[0]
+    finally:
+        con.close()
+
+
+def _build_conversation_messages(
+    conv: "Conversation",
+    bubble_ids: list[str],
+) -> bytes:
     """
-    Encode a ToolCallMessage as a ConversationStep (proto agent.v1.ConversationStep)
-    using field 2 (tool_call → TruncatedToolCall, field 34 in ToolCall).
+    Build repeated ConversationMessage protos from the normalised conversation.
 
-    TruncatedToolCall (field 34 in ToolCall):
-      field 1: original_step_blob_id (bytes) — any 32-byte id, unused for display
-      field 3: result (TruncatedToolCallResult)
-        field 1: success (TruncatedToolCallSuccess) — empty message
+    Each turn becomes a ConversationMessage with:
+      field 1  text        (string)
+      field 2  type        (enum: 1=HUMAN, 2=AI)
+      field 13 bubble_id   (string)
+      field 29 is_agentic  (bool)
+      field 78 created_at  (string, ISO timestamp)
 
-    We use TruncatedToolCall because:
-    - It's designed for summarised/imported history
-    - Does not require tool-specific argument encoding
-    - Cursor still shows it correctly in conversation history
+    Tool calls are encoded as AI text messages with a structured summary
+    of the call and its result.
+
+    ``bubble_ids`` is an ordered list of bubble IDs from
+    ``fullConversationHeadersOnly`` (excluding cap30 anchors).  We assign
+    one bubble_id per ConversationMessage.
     """
-    # TruncatedToolCallSuccess — empty message, no fields
-    trunc_success = b""
-    # TruncatedToolCallResult — field 1: success (embedded message)
-    trunc_result = _pb_message(1, trunc_success)
-    # TruncatedToolCall — field 1: original_step_blob_id, field 3: result
-    placeholder_id = _new_blob_id()
-    trunc_call = _pb_bytes(1, placeholder_id) + _pb_message(3, trunc_result)
-    # ToolCall — field 34: truncated_tool_call
-    tool_call_msg = _pb_message(34, trunc_call)
-    # ConversationStep — field 2: tool_call (oneof)
-    return _pb_message(2, tool_call_msg)
-
-
-def _store_json_blob(con: "sqlite3.Connection", data: dict) -> bytes:
-    """
-    Serialize *data* as a compact JSON blob, store it in agentKv:blob:{hex},
-    and return the 32-byte blob ID.
-
-    These blobs are the ConversationStateStructure.rootPromptMessagesJson entries
-    (field 1) — the server reads them to reconstruct conversation history.
-    """
-    raw = json.dumps(data, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-    blob_id = _new_blob_id()
-    _store_blob(con, blob_id, raw)
-    return blob_id
-
-
-def _write_agent_kv(conv: "Conversation", con: "sqlite3.Connection") -> str:
-    """
-    Write native binary protobuf blobs to agentKv:blob:{id} and return the
-    ConversationStateStructure (bk) encoded as '~' + base64 for composerData.
-
-    Cursor's agent stores two parallel representations of conversation history:
-
-    A) rootPromptMessagesJson (field 1, repeated bytes) — blob IDs pointing to
-       JSON message blobs in the format {"role":"user/assistant/tool","content":...}.
-       The SERVER reads these when it needs to reconstruct the prior conversation.
-       WITHOUT field 1, the agent sees no history and treats every new message
-       as the first message in a fresh conversation.
-
-    B) turns[] (field 8, repeated bytes) — blob IDs pointing to
-       ConversationTurnStructure protobuf blobs.  Cursor's LOCAL QWe function
-       reads these to build the UI conversation display (bubbles, headers).
-
-    We write both so that:
-    - The server has full context when the user sends a new message.
-    - The Cursor UI shows prior bubbles correctly.
-    """
-    # -----------------------------------------------------------------------
-    # Group turns: user message + following assistant/tool turns = one group.
-    # -----------------------------------------------------------------------
-    groups: list[tuple[str, list["MessageTurn"]]] = []
-    current_user: str | None = None
-    current_steps: list["MessageTurn"] = []
+    msgs = b""
+    bid_idx = 0
 
     for turn in conv.turns:
-        if isinstance(turn, TextMessage) and turn.role == "user":
-            if current_user is not None:
-                groups.append((current_user, current_steps))
-            current_user = turn.text
-            current_steps = []
+        bid = bubble_ids[bid_idx] if bid_idx < len(bubble_ids) else str(uuid.uuid4())
+        bid_idx += 1
+        ts = turn.timestamp.isoformat() if turn.timestamp else datetime.now(timezone.utc).isoformat()
+
+        if isinstance(turn, TextMessage):
+            msg_type = 1 if turn.role == "user" else 2  # HUMAN / AI
+            msg = (
+                _pb_string(1, turn.text)
+                + _pb_enum(2, msg_type)
+                + _pb_string(13, bid)
+                + _pb_bool(29, True)
+                + _pb_string(78, ts)
+            )
+            msgs += _pb_message(1, msg)
+
+        elif isinstance(turn, ToolCallMessage):
+            # Encode tool call as AI text: "[Tool: Name]\nInput: ...\nResult: ..."
+            result_text = turn.result if isinstance(turn.result, str) else json.dumps(turn.result)
+            input_text = json.dumps(turn.input or {}, ensure_ascii=False)
+            text = f"[Tool: {turn.name}]\nInput: {input_text}\nResult: {result_text}"
+            msg = (
+                _pb_string(1, text)
+                + _pb_enum(2, 2)  # AI
+                + _pb_string(13, bid)
+                + _pb_bool(29, True)
+                + _pb_string(78, ts)
+            )
+            msgs += _pb_message(1, msg)
+
+    return msgs
+
+
+def _convert_oal_to_nal(
+    conv: "Conversation",
+    composer_id: str,
+    bubble_ids: list[str],
+    auth_token: str,
+) -> bytes:
+    """
+    Call Cursor's ConvertOALToNAL endpoint to upload conversation history.
+
+    Returns the raw response bytes (ConvertOALToNALResponse protobuf).
+    Raises RuntimeError on failure.
+    """
+    import urllib.request
+
+    # Build StreamUnifiedChatRequest (field 1 of ConvertOALToNALRequest)
+    conversation_msgs = _build_conversation_messages(conv, bubble_ids)
+    unified_request = (
+        conversation_msgs                       # field 1: repeated ConversationMessage
+        + _pb_string(23, composer_id)            # field 23: conversation_id
+        + _pb_bool(27, True)                     # field 27: is_agentic
+    )
+
+    # Build ConvertOALToNALRequest
+    body = _pb_message(1, unified_request)  # field 1: request
+
+    req = urllib.request.Request(
+        _CONVERT_URL,
+        data=body,
+        headers={
+            "Content-Type": "application/proto",
+            "Authorization": f"Bearer {auth_token}",
+            "Connect-Protocol-Version": "1",
+        },
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            return resp.read()
+    except urllib.error.HTTPError as e:
+        err_body = e.read().decode("utf-8", errors="replace")
+        raise RuntimeError(
+            f"ConvertOALToNAL failed (HTTP {e.code}): {err_body}"
+        ) from e
+
+
+def _parse_proto_fields(data: bytes) -> list[tuple[int, int, bytes]]:
+    """
+    Parse a protobuf message into a list of (field_num, wire_type, value).
+
+    For wire type 2 (length-delimited): value = raw bytes payload.
+    For wire type 0 (varint): value = varint bytes (not decoded).
+    """
+    results = []
+    pos = 0
+
+    def _read_varint(d: bytes, p: int) -> tuple[int, int]:
+        r, s = 0, 0
+        while p < len(d):
+            b = d[p]; p += 1
+            r |= (b & 0x7F) << s
+            if not (b & 0x80):
+                return r, p
+            s += 7
+        return r, p
+
+    while pos < len(data):
+        tag, pos = _read_varint(data, pos)
+        field_num = tag >> 3
+        wire_type = tag & 7
+        if wire_type == 2:  # length-delimited
+            length, pos = _read_varint(data, pos)
+            value = data[pos:pos + length]
+            pos += length
+            results.append((field_num, wire_type, value))
+        elif wire_type == 0:  # varint
+            val, pos = _read_varint(data, pos)
+            results.append((field_num, wire_type, val.to_bytes(8, "little")))
+        elif wire_type == 5:  # 32-bit fixed
+            results.append((field_num, wire_type, data[pos:pos + 4]))
+            pos += 4
+        elif wire_type == 1:  # 64-bit fixed
+            results.append((field_num, wire_type, data[pos:pos + 8]))
+            pos += 8
         else:
-            if current_user is None:
-                current_user = ""
-            current_steps.append(turn)
+            break  # unknown wire type
 
-    if current_user is not None:
-        groups.append((current_user, current_steps))
+    return results
 
-    # -----------------------------------------------------------------------
-    # Build field 1 (rootPromptMessagesJson) and field 8 (turns) simultaneously.
-    #
-    # Anthropic Messages API constraint: no two consecutive same-role messages.
-    # Strategy: accumulate assistant content blocks (text + tool-calls) in a
-    # pending buffer; flush to ONE assistant blob when a tool-call is seen
-    # (so the tool-result can follow immediately), then reset the buffer.
-    # Any remaining text at end-of-group becomes its own assistant blob.
-    # -----------------------------------------------------------------------
-    root_msg_blob_ids: list[bytes] = []
-    turn_blob_ids: list[bytes] = []
 
-    for user_text, steps in groups:
-        # ---- A: rootPromptMessagesJson user message ----
-        user_json_id = _store_json_blob(con, {
-            "role": "user",
-            "content": f"<user_query>\n{user_text}\n</user_query>",
-        })
-        root_msg_blob_ids.append(user_json_id)
+def _store_nal_response(
+    response_bytes: bytes,
+    con: "sqlite3.Connection",
+) -> str:
+    """
+    Parse a ConvertOALToNALResponse protobuf and store blobs locally.
 
-        # ---- B: protobuf UserMessage blob (for field 8 turns) ----
-        msg_id = str(uuid.uuid4())
-        user_pb_blob = _pb_string(1, user_text) + _pb_string(2, msg_id)
-        user_pb_id = _new_blob_id()
-        _store_blob(con, user_pb_id, user_pb_blob)
+    ConvertOALToNALResponse:
+      field 1: conversation_state (ConversationStateStructure, bytes)
+      field 2: blobs (map<string, bytes> — key=hex SHA-256, value=binary)
+      field 3: bubble_checkpoints (map<string, ConversationStateStructure>)
 
-        step_blob_ids: list[bytes] = []
+    Protobuf maps are encoded as repeated message fields where each entry
+    has field 1 = key and field 2 = value.
 
-        # Pending assistant content blocks (text and/or tool-calls) that will be
-        # flushed as ONE assistant blob once a tool-call is encountered or at
-        # end-of-steps.
-        pending_asst: list[dict] = []
+    Returns the conversationState as ``"~" + base64(binary)`` for composerData.
+    """
+    fields = _parse_proto_fields(response_bytes)
 
-        def _flush_pending_asst() -> None:
-            nonlocal pending_asst
-            if not pending_asst:
-                return
-            # Native Cursor assistant blobs always have a top-level "id": "1".
-            # This is required for the Cursor server to correctly parse the blob.
-            asst_json_id = _store_json_blob(con, {
-                "id": "1",
-                "role": "assistant",
-                "content": pending_asst,
-            })
-            root_msg_blob_ids.append(asst_json_id)
-            pending_asst = []
+    conversation_state_bytes: bytes | None = None
+    blob_count = 0
 
-        for step in steps:
-            if isinstance(step, TextMessage):
-                if step.role != "assistant":
-                    continue
-                # Accumulate; do NOT flush yet — wait for a tool-call or end.
-                pending_asst.append({"type": "text", "text": step.text})
+    for field_num, wire_type, value in fields:
+        if field_num == 1 and wire_type == 2:
+            # conversation_state — raw ConversationStateStructure
+            conversation_state_bytes = value
 
-                # ---- B: protobuf AssistantMessage step ----
-                step_blob = _pb_message(1, _pb_string(1, step.text))
-                step_id = _new_blob_id()
-                _store_blob(con, step_id, step_blob)
-                step_blob_ids.append(step_id)
-
-            else:
-                # ToolCallMessage — add its tool-call block to pending, then
-                # flush the whole batch (text prefix + this tool-call) as ONE
-                # assistant blob, followed immediately by its tool-result blob.
-                tool_call_id = f"toolu_{uuid.uuid4().hex[:24]}"
-                cursor_name = _CC_TOOL_MAP.get(step.name, (step.name,))[0]
-
-                pending_asst.append({
-                    "type": "tool-call",
-                    "toolCallId": tool_call_id,
-                    "toolName": cursor_name,
-                    "args": step.input or {},
-                    "providerOptions": {
-                        "cursor": {
-                            "rawToolCallArgs": json.dumps(
-                                step.input or {}, ensure_ascii=False
-                            ),
-                        },
-                    },
-                })
-                _flush_pending_asst()
-
-                # ---- A: rootPromptMessagesJson tool-result message ----
-                # Native tool blobs have top-level "id" = the tool call ID,
-                # and "providerOptions" at the top level.
-                result_text = (
-                    step.result
-                    if isinstance(step.result, str)
-                    else json.dumps(step.result)
+        elif field_num == 2 and wire_type == 2:
+            # map entry: parse inner message for key (field 1) and value (field 2)
+            entry_fields = _parse_proto_fields(value)
+            blob_key: str | None = None
+            blob_value: bytes | None = None
+            for ef_num, ef_wt, ef_val in entry_fields:
+                if ef_num == 1 and ef_wt == 2:
+                    blob_key = ef_val.decode("utf-8")
+                elif ef_num == 2 and ef_wt == 2:
+                    blob_value = ef_val
+            if blob_key is not None and blob_value is not None:
+                con.execute(
+                    "INSERT OR REPLACE INTO cursorDiskKV (key, value) VALUES (?, ?)",
+                    (f"agentKv:blob:{blob_key}", blob_value),
                 )
-                tool_json_id = _store_json_blob(con, {
-                    "role": "tool",
-                    "id": tool_call_id,
-                    "content": [{
-                        "type": "tool-result",
-                        "toolName": cursor_name,
-                        "toolCallId": tool_call_id,
-                        "result": result_text,
-                    }],
-                    "providerOptions": {
-                        "cursor": {
-                            "highLevelToolCallResult": {
-                                "output": {"success": True},
-                            },
-                        },
-                    },
-                })
-                root_msg_blob_ids.append(tool_json_id)
+                blob_count += 1
 
-                # ---- B: protobuf TruncatedToolCall step ----
-                step_blob = _encode_tool_call_step(step)
-                step_id = _new_blob_id()
-                _store_blob(con, step_id, step_blob)
-                step_blob_ids.append(step_id)
+        elif field_num == 3 and wire_type == 2:
+            # bubble_checkpoints map entry — store as bubble checkpoint states
+            entry_fields = _parse_proto_fields(value)
+            ckpt_key: str | None = None
+            ckpt_value: bytes | None = None
+            for ef_num, ef_wt, ef_val in entry_fields:
+                if ef_num == 1 and ef_wt == 2:
+                    ckpt_key = ef_val.decode("utf-8")
+                elif ef_num == 2 and ef_wt == 2:
+                    ckpt_value = ef_val
+            if ckpt_key is not None and ckpt_value is not None:
+                # Store checkpoint as base64 blob for later retrieval
+                con.execute(
+                    "INSERT OR REPLACE INTO cursorDiskKV (key, value) VALUES (?, ?)",
+                    (f"agentKv:bubbleCheckpoint:{ckpt_key}", ckpt_value),
+                )
 
-        # Flush any remaining assistant text that came after the last tool-call
-        # (or if there were only text steps with no tool-calls at all).
-        _flush_pending_asst()
+    if conversation_state_bytes is None:
+        raise RuntimeError("ConvertOALToNAL response missing conversation_state")
 
-        # ---- B: protobuf ConversationTurnStructure ----
-        turn_struct = _pb_bytes(1, user_pb_id)
-        for sid in step_blob_ids:
-            turn_struct += _pb_bytes(2, sid)
-        turn_struct += _pb_string(3, str(uuid.uuid4()))
-
-        conv_turn_struct = _pb_message(1, turn_struct)
-        turn_id = _new_blob_id()
-        _store_blob(con, turn_id, conv_turn_struct)
-        turn_blob_ids.append(turn_id)
-
-    # -----------------------------------------------------------------------
-    # Build ConversationStateStructure (bk):
-    #   field 1 (repeated bytes) = rootPromptMessagesJson blob IDs
-    #   field 8 (repeated bytes) = ConversationTurnStructure blob IDs
-    # -----------------------------------------------------------------------
-    state_buf = bytearray()
-    for mid in root_msg_blob_ids:
-        state_buf += _pb_bytes(1, mid)
-    for tid in turn_blob_ids:
-        state_buf += _pb_bytes(8, tid)
-
-    return "~" + base64.b64encode(bytes(state_buf)).decode()
+    return "~" + base64.b64encode(conversation_state_bytes).decode()
 
 
 # Map Claude Code API model IDs to Cursor's internal model name strings.
@@ -802,181 +808,6 @@ def _encode_cursor_projects_path(project_path: Path) -> str:
     return s
 
 
-def _write_agent_transcript(conv: "Conversation", composer_id: str, project_path: Path) -> None:
-    """
-    Write ~/.cursor/projects/{encoded}/agent-transcripts/{composer_id}/{composer_id}.jsonl
-
-    The Cursor agent reads this file to reconstruct conversation history context when
-    the user resumes a conversation. Without it the agent cannot see any prior work.
-
-    Format (one JSON object per line):
-    - user turn:      {"role":"user","message":{"content":[{"type":"text","text":"<user_query>\\n...\\n</user_query>"}]}}
-    - assistant turn: {"role":"assistant","message":{"content":[text_block?, ...tool_use_blocks]}}
-
-    Tool *result* messages are NOT written — native transcripts never include them.
-    Consecutive assistant turns (text + tool calls) between two user messages are
-    merged into one assistant entry.
-    """
-    encoded = _encode_cursor_projects_path(project_path)
-    transcript_dir = (
-        Path.home() / ".cursor" / "projects" / encoded
-        / "agent-transcripts" / composer_id
-    )
-    transcript_dir.mkdir(parents=True, exist_ok=True)
-    transcript_file = transcript_dir / f"{composer_id}.jsonl"
-
-    lines: list[str] = []
-    pending_asst: list[dict] = []
-
-    def _flush_asst() -> None:
-        nonlocal pending_asst
-        if pending_asst:
-            lines.append(json.dumps(
-                {"role": "assistant", "message": {"content": pending_asst}},
-                ensure_ascii=False, separators=(",", ":"),
-            ))
-            pending_asst = []
-
-    for turn in conv.turns:
-        if isinstance(turn, TextMessage):
-            if turn.role == "user":
-                _flush_asst()
-                lines.append(json.dumps(
-                    {"role": "user", "message": {"content": [
-                        {"type": "text", "text": f"<user_query>\n{turn.text}\n</user_query>"},
-                    ]}},
-                    ensure_ascii=False, separators=(",", ":"),
-                ))
-            else:
-                pending_asst.append({"type": "text", "text": turn.text})
-        else:
-            # ToolCallMessage — represent as tool_use; no tool_result in transcript.
-            # Native Cursor transcripts use only type/name/input (no "id" field).
-            cursor_name = _CC_TOOL_MAP.get(turn.name, (turn.name,))[0]
-            pending_asst.append({
-                "type": "tool_use",
-                "name": cursor_name,
-                "input": turn.input,
-            })
-
-    _flush_asst()
-
-    transcript_file.write_text("\n".join(lines), encoding="utf-8")
-
-
-def _encode_cursor_exp_path(project_path: Path) -> str:
-    """
-    Encode a project path for ~/.cursor-exp/projects/{encoded}/.
-
-    All non-alphanumeric characters are replaced by '-'.
-    If the result exceeds 200 chars, truncate and append a hash.
-    """
-    encoded = re.sub(r"[^a-zA-Z0-9]", "-", str(project_path))
-    if len(encoded) <= 200:
-        return encoded
-    h = 0
-    for c in str(project_path):
-        h = (h * 31 + ord(c)) & 0xFFFFFFFF
-    return f"{encoded[:200]}-{h:x}"
-
-
-def _write_cc_session_jsonl(
-    conv: "Conversation",
-    session_id: str,
-    project_path: Path,
-) -> str:
-    """
-    Write a Claude Code session JSONL file to
-    ``~/.cursor-exp/projects/{encodedPath}/{sessionId}.jsonl``.
-
-    This is read by Cursor's ``"claude-code"`` agent backend (which spawns
-    a Claude Code subprocess with ``--resume``).  The format is identical to
-    Claude Code's native JSONL session files.
-
-    Returns the session_id.
-    """
-    encoded = _encode_cursor_exp_path(project_path)
-    session_dir = Path.home() / ".cursor-exp" / "projects" / encoded
-    session_dir.mkdir(parents=True, exist_ok=True)
-    session_file = session_dir / f"{session_id}.jsonl"
-
-    prev_uuid: str | None = None
-
-    def _make_base(rec_type: str, rec_uuid: str, ts: str) -> dict:
-        return {
-            "type": rec_type,
-            "uuid": rec_uuid,
-            "parentUuid": prev_uuid,
-            "sessionId": session_id,
-            "timestamp": ts,
-            "isSidechain": False,
-            "userType": "external",
-            "cwd": str(project_path),
-        }
-
-    def _msg_id() -> str:
-        return f"msg_{uuid.uuid4().hex[:20]}"
-
-    lines: list[str] = []
-
-    for turn in conv.turns:
-        ts = turn.timestamp.isoformat() if turn.timestamp else datetime.now(timezone.utc).isoformat()
-
-        if isinstance(turn, TextMessage) and turn.role == "user":
-            rec_uuid = str(uuid.uuid4())
-            record = _make_base("user", rec_uuid, ts)
-            record["message"] = {"role": "user", "content": turn.text}
-            lines.append(json.dumps(record, ensure_ascii=False))
-            prev_uuid = rec_uuid
-
-        elif isinstance(turn, TextMessage) and turn.role == "assistant":
-            # Collect consecutive assistant text + tool calls into one record.
-            rec_uuid = str(uuid.uuid4())
-            record = _make_base("assistant", rec_uuid, ts)
-            record["message"] = {
-                "id": _msg_id(),
-                "role": "assistant",
-                "content": [{"type": "text", "text": turn.text}],
-            }
-            lines.append(json.dumps(record, ensure_ascii=False))
-            prev_uuid = rec_uuid
-
-        elif isinstance(turn, ToolCallMessage):
-            # Assistant record with tool_use
-            tool_use_id = f"toolu_{uuid.uuid4().hex[:24]}"
-            asst_uuid = str(uuid.uuid4())
-            asst_record = _make_base("assistant", asst_uuid, ts)
-            asst_record["message"] = {
-                "id": _msg_id(),
-                "role": "assistant",
-                "content": [{
-                    "type": "tool_use",
-                    "id": tool_use_id,
-                    "name": turn.name,
-                    "input": turn.input or {},
-                }],
-            }
-            lines.append(json.dumps(asst_record, ensure_ascii=False))
-            prev_uuid = asst_uuid
-
-            # User record with tool_result
-            result_uuid = str(uuid.uuid4())
-            result_record = _make_base("user", result_uuid, ts)
-            result_text = turn.result if isinstance(turn.result, str) else json.dumps(turn.result)
-            result_record["message"] = {
-                "role": "user",
-                "content": [{
-                    "type": "tool_result",
-                    "tool_use_id": tool_use_id,
-                    "content": result_text,
-                }],
-            }
-            result_record["toolUseResult"] = {"type": "tool_result"}
-            lines.append(json.dumps(result_record, ensure_ascii=False))
-            prev_uuid = result_uuid
-
-    session_file.write_text("\n".join(lines), encoding="utf-8")
-    return session_id
 
 
 def _now_ms() -> int:
@@ -1589,18 +1420,23 @@ class CursorAdapter(ToolAdapter):
                         )
                         conversation_map[cap30_id] = cap30
 
-                # Write the session JSONL for the "claude-code" agent backend.
-                # Cursor's "claude-code" backend spawns a Claude Code subprocess
-                # that reads conversation history from local JSONL files.
-                cc_session_id = str(uuid.uuid4())
-                _write_cc_session_jsonl(conv, cc_session_id, project_path)
-
-                # Find the last user bubble ID for agentBackendData mapping.
-                last_user_bubble_id = ""
-                for item in reversed(conversation_items):
-                    if item.get("type") == _TYPE_USER:
-                        last_user_bubble_id = item["bubbleId"]
-                        break
+                # Upload conversation history via ConvertOALToNAL.
+                # This creates server-owned blobs so the regular "cursor-agent"
+                # backend has full prior context (all models available).
+                # Collect non-cap30 bubble IDs for the ConversationMessage protos.
+                turn_bubble_ids = [
+                    item["bubbleId"]
+                    for item in conversation_items
+                    if item["bubbleId"] not in {
+                        b_id for b_id, b in conversation_map.items()
+                        if b.get("capabilityType") == 30
+                    }
+                ]
+                auth_token = _get_cursor_auth_token(_global_db_path())
+                nal_response = _convert_oal_to_nal(
+                    conv, composer_id, turn_bubble_ids, auth_token,
+                )
+                conversation_state = _store_nal_response(nal_response, con)
 
                 # Generate a random encryption key for speculative summarization.
                 # Cursor uses this to encrypt summarization data for this conversation.
@@ -1685,18 +1521,9 @@ class CursorAdapter(ToolAdapter):
                     "stopHookLoopCount": 0,
                     "speculativeSummarizationEncryptionKey": speculative_key,
                     "isNAL": True,
-                    "agentBackend": "claude-code",
-                    "agentBackendData": {
-                        "bubbleIdToSessionId": {
-                            last_user_bubble_id: cc_session_id,
-                        },
-                        "bubbleIdToRequestId": {
-                            last_user_bubble_id: last_user_request_id,
-                        },
-                    },
-                    # conversationState left empty — Cursor will create its
-                    # own on first interaction via the "claude-code" backend.
-                    "conversationState": "",
+                    "agentBackend": "cursor-agent",
+                    # conversationState from ConvertOALToNAL — server-owned blobs.
+                    "conversationState": conversation_state,
                     "planModeSuggestionUsed": False,
                     "latestChatGenerationUUID": last_user_request_id,
                     "isAgentic": is_agentic,
@@ -1879,10 +1706,6 @@ class CursorAdapter(ToolAdapter):
                 shutil.rmtree(transcript_dir, ignore_errors=True)
         except Exception:
             pass
-
-        # Write the agent-transcripts JSONL so Cursor's agent can see the full
-        # conversation history when the user resumes this migrated conversation.
-        _write_agent_transcript(conv, composer_id, project_path)
 
         return composer_id
 
