@@ -66,7 +66,7 @@ The tool will launch an interactive TUI that walks you through:
 | Tool calls (Read, Write, Edit, Bash, Glob, Grep, WebFetch, WebSearch, MCP) | ✓ |
 | Bash mode commands and output | ✓ |
 | Plan document and todos | ✓ |
-| Plan mode integration (Cursor treats conversation as having an active plan) | ✓ |
+| Plan mode integration (Cursor treats conversation as having an active plan) | Partial — the plan is written as a markdown document that the Cursor agent can read, but Cursor does not treat it as a native plan |
 | Agent conversation history (Cursor agent sees full prior context when resuming) | ✓ |
 
 ---
