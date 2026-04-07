@@ -864,6 +864,121 @@ def _write_agent_transcript(conv: "Conversation", composer_id: str, project_path
     transcript_file.write_text("\n".join(lines), encoding="utf-8")
 
 
+def _encode_cursor_exp_path(project_path: Path) -> str:
+    """
+    Encode a project path for ~/.cursor-exp/projects/{encoded}/.
+
+    All non-alphanumeric characters are replaced by '-'.
+    If the result exceeds 200 chars, truncate and append a hash.
+    """
+    encoded = re.sub(r"[^a-zA-Z0-9]", "-", str(project_path))
+    if len(encoded) <= 200:
+        return encoded
+    h = 0
+    for c in str(project_path):
+        h = (h * 31 + ord(c)) & 0xFFFFFFFF
+    return f"{encoded[:200]}-{h:x}"
+
+
+def _write_cc_session_jsonl(
+    conv: "Conversation",
+    session_id: str,
+    project_path: Path,
+) -> str:
+    """
+    Write a Claude Code session JSONL file to
+    ``~/.cursor-exp/projects/{encodedPath}/{sessionId}.jsonl``.
+
+    This is read by Cursor's ``"claude-code"`` agent backend (which spawns
+    a Claude Code subprocess with ``--resume``).  The format is identical to
+    Claude Code's native JSONL session files.
+
+    Returns the session_id.
+    """
+    encoded = _encode_cursor_exp_path(project_path)
+    session_dir = Path.home() / ".cursor-exp" / "projects" / encoded
+    session_dir.mkdir(parents=True, exist_ok=True)
+    session_file = session_dir / f"{session_id}.jsonl"
+
+    prev_uuid: str | None = None
+
+    def _make_base(rec_type: str, rec_uuid: str, ts: str) -> dict:
+        return {
+            "type": rec_type,
+            "uuid": rec_uuid,
+            "parentUuid": prev_uuid,
+            "sessionId": session_id,
+            "timestamp": ts,
+            "isSidechain": False,
+            "userType": "external",
+            "cwd": str(project_path),
+        }
+
+    def _msg_id() -> str:
+        return f"msg_{uuid.uuid4().hex[:20]}"
+
+    lines: list[str] = []
+
+    for turn in conv.turns:
+        ts = turn.timestamp.isoformat() if turn.timestamp else datetime.now(timezone.utc).isoformat()
+
+        if isinstance(turn, TextMessage) and turn.role == "user":
+            rec_uuid = str(uuid.uuid4())
+            record = _make_base("user", rec_uuid, ts)
+            record["message"] = {"role": "user", "content": turn.text}
+            lines.append(json.dumps(record, ensure_ascii=False))
+            prev_uuid = rec_uuid
+
+        elif isinstance(turn, TextMessage) and turn.role == "assistant":
+            # Collect consecutive assistant text + tool calls into one record.
+            rec_uuid = str(uuid.uuid4())
+            record = _make_base("assistant", rec_uuid, ts)
+            record["message"] = {
+                "id": _msg_id(),
+                "role": "assistant",
+                "content": [{"type": "text", "text": turn.text}],
+            }
+            lines.append(json.dumps(record, ensure_ascii=False))
+            prev_uuid = rec_uuid
+
+        elif isinstance(turn, ToolCallMessage):
+            # Assistant record with tool_use
+            tool_use_id = f"toolu_{uuid.uuid4().hex[:24]}"
+            asst_uuid = str(uuid.uuid4())
+            asst_record = _make_base("assistant", asst_uuid, ts)
+            asst_record["message"] = {
+                "id": _msg_id(),
+                "role": "assistant",
+                "content": [{
+                    "type": "tool_use",
+                    "id": tool_use_id,
+                    "name": turn.name,
+                    "input": turn.input or {},
+                }],
+            }
+            lines.append(json.dumps(asst_record, ensure_ascii=False))
+            prev_uuid = asst_uuid
+
+            # User record with tool_result
+            result_uuid = str(uuid.uuid4())
+            result_record = _make_base("user", result_uuid, ts)
+            result_text = turn.result if isinstance(turn.result, str) else json.dumps(turn.result)
+            result_record["message"] = {
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": tool_use_id,
+                    "content": result_text,
+                }],
+            }
+            result_record["toolUseResult"] = {"type": "tool_result"}
+            lines.append(json.dumps(result_record, ensure_ascii=False))
+            prev_uuid = result_uuid
+
+    session_file.write_text("\n".join(lines), encoding="utf-8")
+    return session_id
+
+
 def _now_ms() -> int:
     return int(datetime.now(timezone.utc).timestamp() * 1000)
 
@@ -1474,11 +1589,18 @@ class CursorAdapter(ToolAdapter):
                         )
                         conversation_map[cap30_id] = cap30
 
-                # Build the agent context store entries and conversationState.
-                # Cursor's agent reads history from agentKv:blob: entries keyed by
-                # SHA-256 hash; conversationState is a protobuf listing those hashes.
-                # Individual bubbleId: keys are only used for UI rendering.
-                conversation_state = _write_agent_kv(conv, con)
+                # Write the session JSONL for the "claude-code" agent backend.
+                # Cursor's "claude-code" backend spawns a Claude Code subprocess
+                # that reads conversation history from local JSONL files.
+                cc_session_id = str(uuid.uuid4())
+                _write_cc_session_jsonl(conv, cc_session_id, project_path)
+
+                # Find the last user bubble ID for agentBackendData mapping.
+                last_user_bubble_id = ""
+                for item in reversed(conversation_items):
+                    if item.get("type") == _TYPE_USER:
+                        last_user_bubble_id = item["bubbleId"]
+                        break
 
                 # Generate a random encryption key for speculative summarization.
                 # Cursor uses this to encrypt summarization data for this conversation.
@@ -1563,10 +1685,18 @@ class CursorAdapter(ToolAdapter):
                     "stopHookLoopCount": 0,
                     "speculativeSummarizationEncryptionKey": speculative_key,
                     "isNAL": True,
-                    "agentBackend": "cursor-agent",
-                    # conversationState encodes the full message history as a
-                    # protobuf of SHA-256 hashes pointing to agentKv:blob: entries.
-                    "conversationState": conversation_state,
+                    "agentBackend": "claude-code",
+                    "agentBackendData": {
+                        "bubbleIdToSessionId": {
+                            last_user_bubble_id: cc_session_id,
+                        },
+                        "bubbleIdToRequestId": {
+                            last_user_bubble_id: last_user_request_id,
+                        },
+                    },
+                    # conversationState left empty — Cursor will create its
+                    # own on first interaction via the "claude-code" backend.
+                    "conversationState": "",
                     "planModeSuggestionUsed": False,
                     "latestChatGenerationUUID": last_user_request_id,
                     "isAgentic": is_agentic,
