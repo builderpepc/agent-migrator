@@ -205,17 +205,67 @@ class GeminiCliAdapter(ToolAdapter):
                     disp_name = "Edit" if raw_name in ("replace", "edit") else "WriteFile"
                     file_path = args.get("file_path", "unknown")
                     desc = f"Writing to {file_path}" if name == "write_file" else file_path
-                    lines = turn.result.splitlines()
+                    
+                    old_str = args.get("old_string", "")
+                    new_str = args.get("new_string", args.get("content", ""))
+                    
+                    if old_str or new_str:
+                        import difflib
+                        old_lines = old_str.splitlines(keepends=True)
+                        new_lines = new_str.splitlines(keepends=True)
+                        # Ensure lines end with newline for difflib consistency
+                        if old_lines and not old_lines[-1].endswith("\n"): old_lines[-1] += "\n"
+                        if new_lines and not new_lines[-1].endswith("\n"): new_lines[-1] += "\n"
+                        
+                        diff_list = list(difflib.unified_diff(
+                            old_lines, new_lines, 
+                            fromfile=f"{file_path}\tOriginal", 
+                            tofile=f"{file_path}\tWritten", 
+                            n=3
+                        ))
+                        # Gemini CLI v0.37.1 expects a standard unified diff format
+                        diff_text = "".join(diff_list)
+                        
+                        if not diff_text and new_str:
+                            # Fallback for new files or identical content
+                            lines = new_str.splitlines()
+                            diff_text = (
+                                f"--- {file_path}\tOriginal\n"
+                                f"+++ {file_path}\tWritten\n"
+                                f"@@ -1,1 +1,{len(lines)} @@\n"
+                            ) + "\n".join(f"+{l}" for l in lines)
+                    else:
+                        # Fallback to the result string if no input strings are found
+                        diff_text = turn.result
+
                     res_display = {
-                        "fileDiff": f"Index: {file_path}\n===================================================================\n--- {file_path}\tOriginal\n+++ {file_path}\tWritten\n@@ -1,1 +1,{len(lines)} @@\n" + "\n".join(f"+{l}" for l in lines),
-                        "fileName": Path(file_path).name, "filePath": str(project_root / file_path),
-                        "originalContent": "", "newContent": turn.result,
-                        "diffStat": {"model_added_lines": len(lines), "model_removed_lines": 0, "model_added_chars": len(turn.result), "model_removed_chars": 0, "user_added_lines": 0, "user_removed_lines": 0, "user_added_chars": 0, "user_removed_chars": 0},
+                        "fileDiff": diff_text,
+                        "fileName": Path(file_path).name,
+                        "filePath": str(project_root / file_path),
+                        "originalContent": old_str,
+                        "newContent": new_str or turn.result,
+                        "diffStat": {
+                            "model_added_lines": len([l for l in diff_text.splitlines() if l.startswith("+") and not l.startswith("+++")]),
+                            "model_removed_lines": len([l for l in diff_text.splitlines() if l.startswith("-") and not l.startswith("---")]),
+                            "model_added_chars": len(new_str),
+                            "model_removed_chars": len(old_str),
+                            "user_added_lines": 0, "user_removed_lines": 0,
+                            "user_added_chars": 0, "user_removed_chars": 0
+                        },
                         "isNewFile": (name == "write_file")
                     }
                 elif raw_name in ("read_file", "read"):
                     name, disp_name = "read_file", "ReadFile"
                     desc = args.get("file_path", "unknown")
+                elif raw_name in ("grep_search", "grep"):
+                    name, disp_name = "grep_search", "GrepSearch"
+                    pattern = args.get("pattern", "")
+                    path = args.get("dir_path", args.get("path", "."))
+                    desc = f"'{pattern}' in {path}"
+                elif raw_name in ("glob",):
+                    name, disp_name = "glob", "Glob"
+                    pattern = args.get("pattern", "")
+                    desc = pattern
                 elif raw_name in ("invoke_agent", "agent", "codebase_investigator", "generalist"):
                     name, disp_name = "invoke_agent", "Agent"
                     desc = args.get("objective", args.get("request", ""))
