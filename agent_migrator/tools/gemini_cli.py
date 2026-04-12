@@ -48,23 +48,61 @@ def _get_project_hash(project_root: Path) -> str:
     return hashlib.sha256(normalized.encode()).hexdigest()
 
 
+def _find_project_root(path: Path) -> Path:
+    """
+    Finds the project root by climbing up for .git or .gemini,
+    mimicking Gemini CLI's discovery logic.
+    """
+    current = path.resolve()
+    for parent in [current] + list(current.parents):
+        if (parent / ".git").exists() or (parent / ".gemini").exists():
+            return parent
+    return current
+
+
+def _get_project_id_from_registry(project_root: Path) -> Optional[str]:
+    """
+    Reads ~/.gemini/projects.json to find the shortId assigned to this project.
+    """
+    registry_path = _gemini_dir() / "projects.json"
+    if not registry_path.exists():
+        return None
+    
+    try:
+        data = json.loads(registry_path.read_text())
+        projects = data.get("projects", {})
+        normalized_root = _normalize_path(str(project_root))
+        return projects.get(normalized_root)
+    except Exception:
+        return None
+
+
 def _get_chats_dir(project_path: Path) -> Optional[Path]:
     """
     Locate the Gemini CLI chats directory for the project.
-    Uses SHA-256 hash lookup with a fallback to scanning .project_root files.
+    Uses projects.json registry lookup with fallbacks.
     """
     base_tmp = _gemini_dir() / "tmp"
     if not base_tmp.exists():
         return None
 
-    # Primary: Compute hash
-    project_hash = _get_project_hash(project_path)
+    project_root = _find_project_root(project_path)
+    
+    # Primary: Check projects.json registry for the shortId/slug
+    project_id = _get_project_id_from_registry(project_root)
+    if project_id:
+        chats_dir = base_tmp / project_id / "chats"
+        if chats_dir.exists():
+            return chats_dir
+
+    # Secondary: Fallback to SHA-256 hash
+    project_hash = _get_project_hash(project_root)
     chats_dir = base_tmp / project_hash / "chats"
     if chats_dir.exists():
         return chats_dir
 
-    # Fallback: Scan all directories for matching .project_root
-    normalized_target = _normalize_path(str(project_path))
+    # Tertiary: Scan all directories for matching .project_root file
+    normalized_target = _normalize_path(str(project_root))
     try:
         for p in base_tmp.iterdir():
             if not p.is_dir():
@@ -101,8 +139,6 @@ class GeminiCliAdapter(ToolAdapter):
             try:
                 mtime = datetime.fromtimestamp(json_file.stat().st_mtime, tz=timezone.utc)
                 
-                # For JSONL, we need to read the first line for metadata
-                # For JSON, we read the whole file
                 is_jsonl = json_file.suffix == ".jsonl"
                 with open(json_file, "r", encoding="utf-8") as f:
                     if is_jsonl:
@@ -129,16 +165,14 @@ class GeminiCliAdapter(ToolAdapter):
                     else mtime
                 )
 
-                # Count messages (for JSONL we'd need to read the whole file, so we estimate
-                # or just count if it's small. Gemini CLI metadata doesn't store count.)
+                # Count messages for the TUI
                 message_count = 0
                 if not is_jsonl:
                     messages = data.get("messages", [])
                     message_count = sum(1 for m in messages if m.get("type") in ("user", "gemini"))
                 else:
                     # Quick estimation for JSONL to keep list_conversations fast
-                    # In a real scenario, we might want to cache this.
-                    message_count = 0 # Will be updated if we read the whole file
+                    message_count = 0 
 
                 results.append(
                     ConversationInfo(
@@ -175,15 +209,7 @@ class GeminiCliAdapter(ToolAdapter):
                         continue
                     record = json.loads(line)
                     if "$rewindTo" in record:
-                        # Simple rewind logic: remove messages after the ID
-                        rewind_id = record["$rewindTo"]
-                        new_msgs = []
-                        for m in messages:
-                            # Note: models.py MessageTurn doesn't have ID, but we can't 
-                            # perfectly match Gemini's rewind without it. 
-                            # For migration, we usually just want the final state.
-                            new_msgs.append(m)
-                        messages = new_msgs
+                        pass 
                     elif "$set" in record:
                         metadata.update(record["$set"])
                     elif "sessionId" in record and "projectHash" in record:
@@ -196,7 +222,6 @@ class GeminiCliAdapter(ToolAdapter):
                 for msg in data.get("messages", []):
                     self._parse_message_record(msg, messages)
 
-        # Map generic info to ConversationInfo
         mtime = datetime.fromtimestamp(json_file.stat().st_mtime, tz=timezone.utc)
         info = ConversationInfo(
             id=conv_id,
@@ -255,10 +280,7 @@ class GeminiCliAdapter(ToolAdapter):
             for tc in msg.get("toolCalls", []):
                 results = tc.get("result", [])
                 result_str = ""
-                if isinstance(results, str):
-                    result_str = results
-                elif isinstance(results, list):
-                    # Gemini results can be functionResponse or text
+                if isinstance(results, list):
                     parts = []
                     for part in results:
                         if not isinstance(part, dict): continue
@@ -268,6 +290,8 @@ class GeminiCliAdapter(ToolAdapter):
                             resp = part["functionResponse"].get("response")
                             parts.append(json.dumps(resp) if isinstance(resp, (dict, list)) else str(resp))
                     result_str = "".join(parts)
+                elif isinstance(results, str):
+                    result_str = results
 
                 messages.append(
                     ToolCallMessage(
@@ -279,14 +303,17 @@ class GeminiCliAdapter(ToolAdapter):
                 )
 
     def write_conversation(self, conv: Conversation, project_path: Path, **kwargs) -> str:
+        project_root = _find_project_root(project_path)
         chats_dir = _get_chats_dir(project_path)
+        
         if not chats_dir:
-            project_hash = _get_project_hash(project_path)
-            chats_dir = _gemini_dir() / "tmp" / project_hash / "chats"
+            project_id = _get_project_id_from_registry(project_root) or _get_project_hash(project_root)
+            chats_dir = _gemini_dir() / "tmp" / project_id / "chats"
             chats_dir.mkdir(parents=True, exist_ok=True)
+            
             root_file = chats_dir.parent / ".project_root"
             if not root_file.exists():
-                root_file.write_text(str(project_path.resolve()))
+                root_file.write_text(_normalize_path(str(project_root)))
 
         session_id = str(uuid.uuid4())
         now_iso = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
@@ -298,11 +325,12 @@ class GeminiCliAdapter(ToolAdapter):
             # 1. Initial metadata record
             metadata = {
                 "sessionId": session_id,
-                "projectHash": _get_project_hash(project_path),
+                "projectHash": _get_project_hash(project_root),
                 "startTime": conv.info.created_at.isoformat().replace("+00:00", "Z"),
                 "lastUpdated": now_iso,
                 "summary": conv.info.name,
                 "model": conv.model or "gemini-2.0-flash",
+                "kind": "main",
             }
             f.write(json.dumps(metadata) + "\n")
 
