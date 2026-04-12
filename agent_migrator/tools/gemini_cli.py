@@ -225,7 +225,7 @@ class GeminiCliAdapter(ToolAdapter):
                 current_turn_tools.append(({
                     "id": call_id, "name": name, "displayName": disp_name, "description": desc, "args": args,
                     "result": [{"functionResponse": {"id": call_id, "name": name, "response": {"output": turn.result}}}],
-                    "resultDisplay": res_display, "status": "success", "timestamp": ts_iso, "renderOutputAsMarkdown": True
+                    "resultDisplay": res_display, "status": "success", "timestamp": ts_iso, "renderOutputAsMarkdown": (name != "run_shell_command")
                 }, ts_iso))
         flush_tools()
 
