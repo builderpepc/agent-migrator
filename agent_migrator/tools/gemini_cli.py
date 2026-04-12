@@ -80,7 +80,6 @@ def _get_chats_dir(project_path: Path) -> Optional[Path]:
     if chats_dir.exists():
         return chats_dir
 
-    # Fallback: scan for .project_root ownership marker
     target_norm = _normalize_path(str(project_root))
     try:
         for p in base_tmp.iterdir():
@@ -261,30 +260,23 @@ class GeminiCliAdapter(ToolAdapter):
                 args = turn.input
                 result_val: Any = turn.result
                 res_display: Any = turn.result
-                kind = "other"
                 
-                # Parity alignment with Gemini CLI 0.37.1 UI
-                # Critical: Gemini 0.37.1 UI uses 'name' field to bold AND to allowlist for compact rendering.
-                # 'displayName' should be populated but matches 'name'.
-                
+                # Precise parity with Gemini CLI 0.37.1
                 norm_name = raw_name.lower()
                 if norm_name in ("run_shell_command", "bash"):
-                    name = "Shell"
-                    canonical_name = "run_shell_command"
-                    kind = "execute"
+                    name = "run_shell_command"
+                    disp_name = "Shell"
                     cmd = args.get("command", "")
                     desc = f"{cmd} [current working directory {project_root}]"
                     res_display = turn.result
                 elif norm_name in ("replace", "edit", "write", "write_file"):
-                    name = "Edit" if norm_name in ("replace", "edit") else "WriteFile"
-                    canonical_name = "replace" if norm_name in ("replace", "edit") else "write_file"
-                    kind = "edit"
+                    name = "replace" if norm_name in ("replace", "edit") else "write_file"
+                    disp_name = "Edit" if norm_name in ("replace", "edit") else "WriteFile"
                     file_path = args.get("file_path", "unknown")
-                    desc = file_path
-                    diff_text = turn.result
+                    desc = f"Writing to {file_path}" if name == "write_file" else file_path
                     
-                    # Gemini CLI 0.37.1 DiffRenderer strictly requires Index header + @@ hunk
-                    if not diff_text.startswith("@@") and not diff_text.startswith("Index:"):
+                    diff_text = turn.result
+                    if not diff_text.startswith("Index:"):
                         lines = diff_text.splitlines()
                         diff_text = (
                             f"Index: {file_path}\n"
@@ -307,54 +299,42 @@ class GeminiCliAdapter(ToolAdapter):
                         "isNewFile": True if norm_name == "write" else False
                     }
                 elif norm_name in ("read_file", "read"):
-                    name = "ReadFile"
-                    canonical_name = "read_file"
-                    kind = "read"
+                    name = "read_file"
+                    disp_name = "ReadFile"
                     desc = args.get("file_path", "unknown")
                     res_display = turn.result
                 elif norm_name in ("invoke_agent", "agent", "codebase_investigator", "generalist"):
-                    name = "Agent"
-                    canonical_name = "invoke_agent"
-                    kind = "agent"
+                    name = "invoke_agent"
+                    disp_name = "Agent"
                     desc = args.get("objective", args.get("request", args.get("prompt", "")))
                     res_display = {
                         "isSubagentProgress": True, "agentName": "Subagent",
                         "recentActivity": [{"id": str(uuid.uuid4()), "type": "thought", "content": turn.result, "status": "completed"}],
                         "state": "completed", "result": turn.result
                     }
-                elif norm_name in ("enter_plan_mode", "enterplanmode", "enterplanmodetool"):
-                    name = "Enter Plan Mode"
-                    canonical_name = "enter_plan_mode"
-                    kind = "plan"
-                    desc = args.get("reason", "")
-                elif norm_name in ("exit_plan_mode", "exitplanmode", "exitplanmodetool"):
-                    name = "Exit Plan Mode"
-                    canonical_name = "exit_plan_mode"
-                    kind = "plan"
-                    desc = args.get("plan_filename", args.get("plan", ""))
                 else:
                     name = raw_name
-                    canonical_name = raw_name
+                    disp_name = raw_name
+                    desc = ""
 
-                call_id = f"{canonical_name}_{int(datetime.now().timestamp() * 1000)}_0"
+                call_id = f"{name}_{int(datetime.now().timestamp() * 1000)}_0"
                 tool_call = {
                     "id": call_id,
-                    "name": name, # v0.37.1 UI title AND compact allowlist key
-                    "displayName": name,
+                    "name": name,
+                    "displayName": disp_name,
                     "description": desc,
                     "args": args,
                     "result": [{
                         "functionResponse": {
                             "id": call_id,
-                            "name": canonical_name,
+                            "name": name,
                             "response": {"output": result_val}
                         }
                     }],
                     "resultDisplay": res_display,
                     "status": "success",
                     "timestamp": ts_iso,
-                    "kind": kind,
-                    "renderOutputAsMarkdown": (kind != "execute")
+                    "renderOutputAsMarkdown": True
                 }
                 current_turn_tools.append((tool_call, ts_iso))
         flush_tools()
