@@ -220,7 +220,8 @@ class GeminiCliAdapter(ToolAdapter):
                                     else:
                                         stdout = resp.get("output", "")
                                         stderr = resp.get("error", "")
-                                        part = "\n".join(filter(None, [stdout, stderr]))
+                                        generic = resp.get("text", "")
+                                        part = "\n".join(filter(None, [stdout, stderr, generic]))
                                         if part: combined_parts.append(part)
                                 else:
                                     combined_parts.append(str(resp))
@@ -244,8 +245,7 @@ class GeminiCliAdapter(ToolAdapter):
                     import re
                     result_text = re.sub(r"\n?Process Group PGID: \d+", "", result_text).strip()
 
-                # For Bash tools, wrap in tags in the intermediary format.
-                # Native CC sessions use these tags in string-based user content.
+                # Ensure Bash results are tagged even if they came from resultDisplay
                 if name == "Bash" and not result_text.startswith("<bash-"):
                     result_text = f"<bash-stdout>{result_text}</bash-stdout>"
 
