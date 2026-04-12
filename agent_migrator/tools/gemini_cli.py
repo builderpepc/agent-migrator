@@ -214,8 +214,8 @@ class GeminiCliAdapter(ToolAdapter):
                                         stdout = resp.get("output", "")
                                         stderr = resp.get("error", "")
                                         tagged = ""
-                                        if stdout: tagged += f"<bash-stdout>\n{stdout}\n</bash-stdout>"
-                                        if stderr: tagged += f"<bash-stderr>\n{stderr}\n</bash-stderr>"
+                                        if stdout: tagged += f"<bash-stdout>{stdout}</bash-stdout>"
+                                        if stderr: tagged += f"<bash-stderr>{stderr}</bash-stderr>"
                                         if tagged: combined_parts.append(tagged)
                                     else:
                                         stdout = resp.get("output", "")
@@ -237,15 +237,17 @@ class GeminiCliAdapter(ToolAdapter):
                     res_val = res_val.get("newContent") or res_val.get("fileDiff") or res_val.get("output") or res_val.get("summary") or json.dumps(res_val)
 
                 result_text = str(res_val)
+                # Clean up Gemini-specific shell markers
                 if result_text.startswith("Output: "):
                     result_text = result_text[len("Output: "):].strip()
                 if "Process Group PGID:" in result_text:
                     import re
                     result_text = re.sub(r"\n?Process Group PGID: \d+", "", result_text).strip()
 
-                # Ensure Bash results are tagged even if they came from resultDisplay
+                # For Bash tools, wrap in tags in the intermediary format.
+                # Native CC sessions use these tags in string-based user content.
                 if name == "Bash" and not result_text.startswith("<bash-"):
-                    result_text = f"<bash-stdout>\n{result_text}\n</bash-stdout>"
+                    result_text = f"<bash-stdout>{result_text}</bash-stdout>"
 
                 messages.append(ToolCallMessage(name=name, input=args, result=result_text, timestamp=ts))
 

@@ -38,6 +38,15 @@ def main():
     print(f"Intermediary Input: {first_bash.input}")
     print(f"Intermediary Result (repr): {repr(first_bash.result)[:200]}...")
     
+    try:
+        res_obj = json.loads(first_bash.result)
+        if isinstance(res_obj, dict) and "output" in res_obj:
+            print("SUCCESS: Intermediary result is correctly JSON-encoded with 'output' key.")
+        else:
+            print(f"FAILURE: Intermediary result is JSON but missing 'output' key or not a dict: {res_obj}")
+    except json.JSONDecodeError:
+        print("FAILURE: Intermediary result is NOT a valid JSON string.")
+    
     # 3. Write back to a new CC session
     new_id = cc_adapter.write_conversation(conv, project_path)
     print(f"Wrote back to new session: {new_id}")
