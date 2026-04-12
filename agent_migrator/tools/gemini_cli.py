@@ -178,9 +178,12 @@ class GeminiCliAdapter(ToolAdapter):
                 elif norm_name == "replace": 
                     name = "Edit"
                     args["file_path"] = args.get("file_path", args.get("filePath", ""))
+                    args["old_string"] = args.get("old_string", args.get("oldString", ""))
+                    args["new_string"] = args.get("new_string", args.get("newString", ""))
                 elif norm_name == "write_file": 
                     name = "Write"
                     args["file_path"] = args.get("file_path", args.get("filePath", ""))
+                    args["content"] = args.get("content", args.get("contents", ""))
                 elif norm_name == "run_shell_command": 
                     name = "Bash"
                 elif norm_name == "grep_search": 
@@ -209,12 +212,20 @@ class GeminiCliAdapter(ToolAdapter):
                                 fr = block["functionResponse"]
                                 resp = fr.get("response", {})
                                 if isinstance(resp, dict):
-                                    # Combine all available output fields
-                                    stdout = resp.get("output", "")
-                                    stderr = resp.get("error", "")
-                                    generic = resp.get("text", "")
-                                    part = "\n".join(filter(None, [stdout, stderr, generic]))
-                                    if part: combined_parts.append(part)
+                                    # Handle Bash output/error specifically for tagging
+                                    if name == "Bash":
+                                        stdout = resp.get("output", "")
+                                        stderr = resp.get("error", "")
+                                        tagged = ""
+                                        if stdout: tagged += f"<bash-stdout>{stdout}</bash-stdout>"
+                                        if stderr: tagged += f"<bash-stderr>{stderr}</bash-stderr>"
+                                        if tagged: combined_parts.append(tagged)
+                                    else:
+                                        stdout = resp.get("output", "")
+                                        stderr = resp.get("error", "")
+                                        generic = resp.get("text", "")
+                                        part = "\n".join(filter(None, [stdout, stderr, generic]))
+                                        if part: combined_parts.append(part)
                                 else:
                                     combined_parts.append(str(resp))
                             elif "parts" in block:
@@ -222,16 +233,17 @@ class GeminiCliAdapter(ToolAdapter):
                                 if isinstance(parts, list):
                                     p_text = "\n".join(p.get("text", "") for p in parts if isinstance(p, dict) and "text" in p)
                                     if p_text: combined_parts.append(p_text)
+                            elif "text" in block:
+                                p_text = block["text"]
+                                if p_text: combined_parts.append(p_text)
                         res_val = "\n".join(combined_parts)
                     if not res_val:
                         res_val = str(res_blocks) if res_blocks else ""
                 
                 if isinstance(res_val, dict):
-                    # Priority: newContent (Write), fileDiff (Edit), output (Bash), summary (Subagent)
                     res_val = res_val.get("newContent") or res_val.get("fileDiff") or res_val.get("output") or res_val.get("summary") or json.dumps(res_val)
 
                 result_text = str(res_val)
-                # Clean up Gemini-specific shell markers
                 if result_text.startswith("Output: "):
                     result_text = result_text[len("Output: "):].strip()
                 if "Process Group PGID:" in result_text:
