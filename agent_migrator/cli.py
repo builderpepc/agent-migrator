@@ -41,8 +41,9 @@ def main() -> None:
 
     from agent_migrator.tools.claude_code import ClaudeCodeAdapter
     from agent_migrator.tools.cursor import CursorAdapter
+    from agent_migrator.tools.gemini_cli import GeminiCliAdapter
 
-    all_adapters = [CursorAdapter(), ClaudeCodeAdapter()]
+    all_adapters = [CursorAdapter(), ClaudeCodeAdapter(), GeminiCliAdapter()]
     available = [a for a in all_adapters if a.is_available()]
 
     if len(available) < 2:

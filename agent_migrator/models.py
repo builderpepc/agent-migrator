@@ -14,7 +14,7 @@ class ConversationInfo:
     created_at: datetime
     message_count: int       # approximate count of text turns
     size_bytes: int
-    source_tool: str         # "cursor" | "claude_code"
+    source_tool: str         # "cursor" | "claude_code" | "gemini_cli"
 
 
 @dataclass
