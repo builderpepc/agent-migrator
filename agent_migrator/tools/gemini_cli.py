@@ -168,6 +168,7 @@ class GeminiCliAdapter(ToolAdapter):
                     elif k == "newString": nk = "new_string"
                     elif k == "replaceAll": nk = "replace_all"
                     elif k == "dirPath": nk = "dir_path"
+                    elif k == "contents": nk = "content"
                     args[nk] = v
 
                 # Map back to intermediary tool names
@@ -212,20 +213,13 @@ class GeminiCliAdapter(ToolAdapter):
                                 fr = block["functionResponse"]
                                 resp = fr.get("response", {})
                                 if isinstance(resp, dict):
-                                    # Handle Bash output/error specifically for tagging
-                                    if name == "Bash":
-                                        stdout = resp.get("output", "")
-                                        stderr = resp.get("error", "")
-                                        tagged = ""
-                                        if stdout: tagged += f"<bash-stdout>{stdout}</bash-stdout>"
-                                        if stderr: tagged += f"<bash-stderr>{stderr}</bash-stderr>"
-                                        if tagged: combined_parts.append(tagged)
-                                    else:
-                                        stdout = resp.get("output", "")
-                                        stderr = resp.get("error", "")
-                                        generic = resp.get("text", "")
-                                        part = "\n".join(filter(None, [stdout, stderr, generic]))
-                                        if part: combined_parts.append(part)
+                                    # Capture all possible output fields from shell/edit tools
+                                    part = "\n".join(filter(None, [
+                                        str(resp.get("output", "")),
+                                        str(resp.get("error", "")),
+                                        str(resp.get("text", ""))
+                                    ]))
+                                    if part: combined_parts.append(part)
                                 else:
                                     combined_parts.append(str(resp))
                             elif "parts" in block:
@@ -241,9 +235,11 @@ class GeminiCliAdapter(ToolAdapter):
                         res_val = str(res_blocks) if res_blocks else ""
                 
                 if isinstance(res_val, dict):
+                    # Priority: newContent (Write), fileDiff (Edit), output (Bash), summary (Subagent)
                     res_val = res_val.get("newContent") or res_val.get("fileDiff") or res_val.get("output") or res_val.get("summary") or json.dumps(res_val)
 
                 result_text = str(res_val)
+                # Clean up Gemini-specific shell markers
                 if result_text.startswith("Output: "):
                     result_text = result_text[len("Output: "):].strip()
                 if "Process Group PGID:" in result_text:
@@ -251,14 +247,6 @@ class GeminiCliAdapter(ToolAdapter):
                     result_text = re.sub(r"\n?Process Group PGID: \d+", "", result_text).strip()
 
                 messages.append(ToolCallMessage(name=name, input=args, result=result_text, timestamp=ts))
-                # If this was a Bash tool, we also want to emit it as a user TextMessage
-                # to ensure visibility in the CC UI, which parses these tags from plain text.
-                if name == "Bash":
-                    # We'll replace the ToolCallMessage we just added with TextMessages
-                    messages.pop()
-                    cmd = args.get("command", "")
-                    messages.append(TextMessage(role="user", text=f"<bash-input>{cmd}</bash-input>", timestamp=ts))
-                    messages.append(TextMessage(role="user", text=result_text, timestamp=ts))
 
     def write_conversation(self, conv: Conversation, project_path: Path, **kwargs) -> str:
         project_root = _find_project_root(project_path)
