@@ -1,6 +1,6 @@
 [project]
 name = "agent-migrator"
-version = "0.1.0"
+version = "0.1.1"
 description = "Migrate conversation history between AI coding tools"
 requires-python = ">=3.10"
 dependencies = [
