@@ -209,11 +209,20 @@ class GeminiCliAdapter(ToolAdapter):
                                 fr = block["functionResponse"]
                                 resp = fr.get("response", {})
                                 if isinstance(resp, dict):
-                                    stdout = resp.get("output", "")
-                                    stderr = resp.get("error", "")
-                                    generic = resp.get("text", "")
-                                    part = "\n".join(filter(None, [stdout, stderr, generic]))
-                                    if part: combined_parts.append(part)
+                                    # Handle Bash output/error specifically for tagging
+                                    if name == "Bash":
+                                        stdout = resp.get("output", "")
+                                        stderr = resp.get("error", "")
+                                        tagged = ""
+                                        if stdout: tagged += f"<bash-stdout>{stdout}</bash-stdout>"
+                                        if stderr: tagged += f"<bash-stderr>{stderr}</bash-stderr>"
+                                        if tagged: combined_parts.append(tagged)
+                                    else:
+                                        stdout = resp.get("output", "")
+                                        stderr = resp.get("error", "")
+                                        generic = resp.get("text", "")
+                                        part = "\n".join(filter(None, [stdout, stderr, generic]))
+                                        if part: combined_parts.append(part)
                                 else:
                                     combined_parts.append(str(resp))
                             elif "parts" in block:
@@ -235,6 +244,10 @@ class GeminiCliAdapter(ToolAdapter):
                 if "Process Group PGID:" in result_text:
                     import re
                     result_text = re.sub(r"\n?Process Group PGID: \d+", "", result_text).strip()
+
+                # For Bash tools, wrap in tags in the intermediary format for UI rendering
+                if name == "Bash" and not result_text.startswith("<bash-"):
+                    result_text = f"<bash-stdout>{result_text}</bash-stdout>"
 
                 messages.append(ToolCallMessage(name=name, input=args, result=result_text, timestamp=ts))
 
