@@ -50,7 +50,7 @@ def _find_project_root(path: Path) -> Path:
 
 
 def _get_project_id_from_registry(project_root: Path) -> Optional[str]:
-    """Reads ~/.gemini/projects.json to find the shortId."""
+    """Reads ~/.gemini/projects.json to find the shortId assigned to this project."""
     registry_path = _gemini_dir() / "projects.json"
     if not registry_path.exists():
         return None
@@ -68,7 +68,7 @@ def _get_project_id_from_registry(project_root: Path) -> Optional[str]:
 
 
 def _get_chats_dir(project_path: Path) -> Optional[Path]:
-    """Locate the Gemini CLI chats directory."""
+    """Locate the Gemini CLI chats directory for the project."""
     base_tmp = _gemini_dir() / "tmp"
     if not base_tmp.exists():
         return None
@@ -202,15 +202,12 @@ class GeminiCliAdapter(ToolAdapter):
                 messages.append(TextMessage(role="assistant", text=full_text, timestamp=ts))
 
             for tc in msg.get("toolCalls", []):
-                # Try resultDisplay first, fallback to result
                 res_parts = tc.get("resultDisplay") or tc.get("result", [])
                 res_str = ""
                 if isinstance(res_parts, list):
-                    # Check if it's AnsiOutput or PartListUnion
                     if res_parts and isinstance(res_parts[0], dict) and "text" in res_parts[0]:
                         res_str = "".join(p.get("text", "") for p in res_parts)
                     else:
-                        # Maybe functionResponse wrap
                         for part in res_parts:
                             if isinstance(part, dict) and "functionResponse" in part:
                                 resp = part["functionResponse"].get("response", "")
@@ -263,17 +260,22 @@ class GeminiCliAdapter(ToolAdapter):
                 result_val: Any = turn.result
                 res_display: Any = turn.result
                 kind = "other"
+                disp_name = raw_name
                 desc = ""
 
+                # Parity alignment with Gemini CLI 0.37.1
                 if raw_name == "run_shell_command":
-                    canonical_name = "run_shell_command"
+                    name = "run_shell_command"
+                    disp_name = "Shell"
                     kind = "execute"
                     cmd = args.get("command", "")
+                    # Match native description pattern strictly
                     desc = f"{cmd} [current working directory {project_root}]"
                     res_display = turn.result
                 elif raw_name in ("replace", "write_file"):
-                    canonical_name = "replace"
+                    name = "replace"
                     kind = "edit"
+                    disp_name = "Edit"
                     file_path = args.get("file_path", "unknown")
                     desc = file_path
                     diff_text = turn.result
@@ -286,12 +288,14 @@ class GeminiCliAdapter(ToolAdapter):
                         "originalContent": "", "newContent": ""
                     }
                 elif raw_name == "read_file":
-                    canonical_name = "read_file"
+                    name = "read_file"
+                    disp_name = "ReadFile"
                     kind = "read"
                     desc = args.get("file_path", "unknown")
                     res_display = turn.result
                 elif raw_name in ("codebase_investigator", "generalist"):
-                    canonical_name = "invoke_agent"
+                    name = "invoke_agent"
+                    disp_name = "Agent"
                     kind = "agent"
                     desc = args.get("objective", args.get("request", ""))
                     res_display = {
@@ -300,25 +304,29 @@ class GeminiCliAdapter(ToolAdapter):
                         "state": "completed", "result": turn.result
                     }
                 elif raw_name in ("EnterPlanMode", "EnterPlanModeTool"):
-                    canonical_name = "enter_plan_mode"
+                    name = "enter_plan_mode"
+                    disp_name = "Enter Plan Mode"
                     kind = "plan"
                     desc = args.get("reason", "")
                 elif raw_name in ("ExitPlanMode", "ExitPlanModeTool"):
-                    canonical_name = "exit_plan_mode"
+                    name = "exit_plan_mode"
+                    disp_name = "Exit Plan Mode"
                     kind = "plan"
                     desc = args.get("plan_filename", "")
                 else:
-                    canonical_name = raw_name
+                    name = raw_name
 
-                call_id = f"tc-{uuid.uuid4().hex[:8]}"
+                call_id = f"{name}_{int(datetime.now().timestamp() * 1000)}_0"
                 tool_call = {
                     "id": call_id,
-                    "name": canonical_name,
+                    "name": name,
+                    "displayName": disp_name,
+                    "description": desc,
                     "args": args,
                     "result": [{
                         "functionResponse": {
                             "id": call_id,
-                            "name": canonical_name,
+                            "name": name,
                             "response": {"output": result_val}
                         }
                     }],
@@ -326,7 +334,6 @@ class GeminiCliAdapter(ToolAdapter):
                     "status": "success",
                     "timestamp": ts_iso,
                     "kind": kind,
-                    "description": desc,
                     "renderOutputAsMarkdown": (kind != "execute")
                 }
                 current_turn_tools.append((tool_call, ts_iso))
