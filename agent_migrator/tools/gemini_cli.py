@@ -28,20 +28,14 @@ def _gemini_dir() -> Path:
 
 
 def _normalize_path(p: str) -> str:
-    """
-    Normalizes a path for reliable comparison, 
-    matching Gemini CLI's ProjectRegistry logic (mostly).
-    """
+    """Normalizes a path for reliable comparison."""
     resolved = os.path.abspath(p)
     normalized = resolved.replace("\\", "/")
     return normalized.lower()
 
 
 def _get_project_hash(project_root: Path) -> str:
-    """
-    Computes the project hash matching Gemini CLI's internal getProjectHash.
-    On Windows, this uses BACKSLASHES because Gemini CLI uses process.cwd().
-    """
+    """Computes the project hash matching Gemini CLI v0.37.1 on Windows."""
     raw_path = str(project_root.resolve())
     return hashlib.sha256(raw_path.encode()).hexdigest()
 
@@ -56,7 +50,7 @@ def _find_project_root(path: Path) -> Path:
 
 
 def _get_project_id_from_registry(project_root: Path) -> Optional[str]:
-    """Reads ~/.gemini/projects.json to find the shortId assigned to this project."""
+    """Reads ~/.gemini/projects.json to find the shortId."""
     registry_path = _gemini_dir() / "projects.json"
     if not registry_path.exists():
         return None
@@ -65,7 +59,6 @@ def _get_project_id_from_registry(project_root: Path) -> Optional[str]:
         data = json.loads(registry_path.read_text())
         projects = data.get("projects", {})
         target_norm = _normalize_path(str(project_root))
-        
         for key, val in projects.items():
             if _normalize_path(key) == target_norm:
                 return val
@@ -75,7 +68,7 @@ def _get_project_id_from_registry(project_root: Path) -> Optional[str]:
 
 
 def _get_chats_dir(project_path: Path) -> Optional[Path]:
-    """Locate the Gemini CLI chats directory for the project."""
+    """Locate the Gemini CLI chats directory."""
     base_tmp = _gemini_dir() / "tmp"
     if not base_tmp.exists():
         return None
@@ -87,7 +80,6 @@ def _get_chats_dir(project_path: Path) -> Optional[Path]:
     if chats_dir.exists():
         return chats_dir
 
-    # Fallback: scan for .project_root ownership marker
     target_norm = _normalize_path(str(project_root))
     try:
         for p in base_tmp.iterdir():
@@ -271,21 +263,17 @@ class GeminiCliAdapter(ToolAdapter):
                 result_val: Any = turn.result
                 res_display: Any = turn.result
                 kind = "other"
-                
-                # Critical: 'name' field in session JSON is what's displayed in bold AND used for isShellTool check.
-                # 'description' field is the secondary text in the header.
-                disp_name = raw_name
                 desc = ""
 
                 if raw_name == "run_shell_command":
-                    disp_name = "Shell" # Matches SHELL_NAME constant
+                    canonical_name = "run_shell_command"
                     kind = "execute"
                     cmd = args.get("command", "")
                     desc = f"{cmd} [current working directory {project_root}]"
                     res_display = turn.result
                 elif raw_name in ("replace", "write_file"):
+                    canonical_name = "replace"
                     kind = "edit"
-                    disp_name = "Edit" # Matches EDIT_DISPLAY_NAME constant
                     file_path = args.get("file_path", "unknown")
                     desc = file_path
                     diff_text = turn.result
@@ -298,12 +286,12 @@ class GeminiCliAdapter(ToolAdapter):
                         "originalContent": "", "newContent": ""
                     }
                 elif raw_name == "read_file":
-                    disp_name = "ReadFile" # Matches READ_FILE_DISPLAY_NAME constant
+                    canonical_name = "read_file"
                     kind = "read"
                     desc = args.get("file_path", "unknown")
                     res_display = turn.result
                 elif raw_name in ("codebase_investigator", "generalist"):
-                    disp_name = "Agent"
+                    canonical_name = "invoke_agent"
                     kind = "agent"
                     desc = args.get("objective", args.get("request", ""))
                     res_display = {
@@ -312,25 +300,33 @@ class GeminiCliAdapter(ToolAdapter):
                         "state": "completed", "result": turn.result
                     }
                 elif raw_name in ("EnterPlanMode", "EnterPlanModeTool"):
-                    disp_name = "Enter Plan Mode"
+                    canonical_name = "enter_plan_mode"
                     kind = "plan"
                     desc = args.get("reason", "")
                 elif raw_name in ("ExitPlanMode", "ExitPlanModeTool"):
-                    disp_name = "Exit Plan Mode"
+                    canonical_name = "exit_plan_mode"
                     kind = "plan"
                     desc = args.get("plan_filename", "")
+                else:
+                    canonical_name = raw_name
 
+                call_id = f"tc-{uuid.uuid4().hex[:8]}"
                 tool_call = {
-                    "id": f"tc-{uuid.uuid4().hex[:8]}",
-                    "name": disp_name, # Critical: v0.37.1 UI uses 'name' for the bolded part
-                    "displayName": disp_name,
-                    "description": desc,
+                    "id": call_id,
+                    "name": canonical_name,
                     "args": args,
-                    "result": [{"functionResponse": {"name": raw_name, "response": {"output": result_val}}}],
+                    "result": [{
+                        "functionResponse": {
+                            "id": call_id,
+                            "name": canonical_name,
+                            "response": {"output": result_val}
+                        }
+                    }],
                     "resultDisplay": res_display,
                     "status": "success",
                     "timestamp": ts_iso,
                     "kind": kind,
+                    "description": desc,
                     "renderOutputAsMarkdown": (kind != "execute")
                 }
                 current_turn_tools.append((tool_call, ts_iso))
@@ -347,7 +343,6 @@ class GeminiCliAdapter(ToolAdapter):
             "kind": "main"
         }
 
-        # Write as .json (monolithic) for compatibility with Gemini CLI 0.37.1
         filename = f"session-{datetime.now().strftime('%Y-%m-%dT%H-%M')}-{session_id[:8]}.json"
         dest_file = chats_dir / filename
         with open(dest_file, "w", encoding="utf-8") as f:
