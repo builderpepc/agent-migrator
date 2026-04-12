@@ -261,42 +261,55 @@ class GeminiCliAdapter(ToolAdapter):
                 result_val: Any = turn.result
                 res_display: Any = turn.result
                 kind = "other"
-                disp_name = raw_name
-                desc = ""
-
-                # Robust mapping for all sources
+                
+                # Parity alignment with Gemini CLI 0.37.1 UI
+                # name: bolded title in UI (Shell, Edit, ReadFile)
+                # canonical_name: internal ID used for functionResponse
+                canonical_name = raw_name
+                
                 norm_name = raw_name.lower()
                 if norm_name in ("run_shell_command", "bash"):
-                    name = "run_shell_command"
-                    disp_name = "Shell"
+                    name = "Shell"
+                    canonical_name = "run_shell_command"
                     kind = "execute"
                     cmd = args.get("command", "")
+                    # Match native description pattern strictly for header rendering
                     desc = f"{cmd} [current working directory {project_root}]"
                     res_display = turn.result
                 elif norm_name in ("replace", "edit", "write", "write_file"):
-                    name = "replace"
+                    name = "Edit"
+                    canonical_name = "replace"
                     kind = "edit"
-                    disp_name = "Edit"
                     file_path = args.get("file_path", "unknown")
                     desc = file_path
                     diff_text = turn.result
-                    if not diff_text.startswith("---") and not diff_text.startswith("@@"):
+                    
+                    # Gemini CLI 0.37.1 DiffRenderer requires Index/=== header AND @@ hunk header
+                    if not diff_text.startswith("@@") and not diff_text.startswith("Index:"):
                         lines = diff_text.splitlines()
-                        diff_text = f"--- /dev/null\n+++ {file_path}\n@@ -0,0 +1,{len(lines)} @@\n" + "\n".join(f"+{l}" for l in lines)
+                        diff_text = (
+                            f"Index: {file_path}\n"
+                            f"===================================================================\n"
+                            f"--- {file_path}\tOriginal\n"
+                            f"+++ {file_path}\tWritten\n"
+                            f"@@ -0,0 +1,{len(lines)} @@\n"
+                        ) + "\n".join(f"+{l}" for l in lines)
+                    
                     res_display = {
                         "fileDiff": diff_text, "fileName": Path(file_path).name,
                         "filePath": str(project_root / file_path),
-                        "originalContent": "", "newContent": ""
+                        "originalContent": "", "newContent": turn.result,
+                        "isNewFile": True if norm_name == "write" else False
                     }
                 elif norm_name in ("read_file", "read"):
-                    name = "read_file"
-                    disp_name = "ReadFile"
+                    name = "ReadFile"
+                    canonical_name = "read_file"
                     kind = "read"
                     desc = args.get("file_path", "unknown")
                     res_display = turn.result
                 elif norm_name in ("invoke_agent", "agent", "codebase_investigator", "generalist"):
-                    name = "invoke_agent"
-                    disp_name = "Agent"
+                    name = "Agent"
+                    canonical_name = "invoke_agent"
                     kind = "agent"
                     desc = args.get("objective", args.get("request", args.get("prompt", "")))
                     res_display = {
@@ -305,30 +318,29 @@ class GeminiCliAdapter(ToolAdapter):
                         "state": "completed", "result": turn.result
                     }
                 elif norm_name in ("enter_plan_mode", "enterplanmode", "enterplanmodetool"):
-                    name = "enter_plan_mode"
-                    disp_name = "Enter Plan Mode"
+                    name = "Enter Plan Mode"
+                    canonical_name = "enter_plan_mode"
                     kind = "plan"
                     desc = args.get("reason", "")
                 elif norm_name in ("exit_plan_mode", "exitplanmode", "exitplanmodetool"):
-                    name = "exit_plan_mode"
-                    disp_name = "Exit Plan Mode"
+                    name = "Exit Plan Mode"
+                    canonical_name = "exit_plan_mode"
                     kind = "plan"
                     desc = args.get("plan_filename", args.get("plan", ""))
                 else:
                     name = raw_name
-                    disp_name = raw_name
 
-                call_id = f"{name}_{int(datetime.now().timestamp() * 1000)}_0"
+                call_id = f"{canonical_name}_{int(datetime.now().timestamp() * 1000)}_0"
                 tool_call = {
                     "id": call_id,
-                    "name": name,
-                    "displayName": disp_name,
+                    "name": name, # v0.37.1 bolded display name
+                    "displayName": name,
                     "description": desc,
                     "args": args,
                     "result": [{
                         "functionResponse": {
                             "id": call_id,
-                            "name": name,
+                            "name": canonical_name,
                             "response": {"output": result_val}
                         }
                     }],
