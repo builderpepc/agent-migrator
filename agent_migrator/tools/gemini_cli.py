@@ -68,7 +68,7 @@ def _get_project_id_from_registry(project_root: Path) -> Optional[str]:
 
 
 def _get_chats_dir(project_path: Path) -> Optional[Path]:
-    """Locate the Gemini CLI chats directory for the project."""
+    """Locate the Gemini CLI chats directory."""
     base_tmp = _gemini_dir() / "tmp"
     if not base_tmp.exists():
         return None
@@ -270,10 +270,10 @@ class GeminiCliAdapter(ToolAdapter):
                     desc = f"{cmd} [current working directory {project_root}]"
                     res_display = turn.result
                 elif norm_name in ("replace", "edit", "write", "write_file"):
-                    name = "replace" if norm_name in ("replace", "edit") else "write_file"
-                    disp_name = "Edit" if norm_name in ("replace", "edit") else "WriteFile"
+                    name = "replace" # Canonical name for ALL edits in 0.37.1
+                    disp_name = "Edit"
                     file_path = args.get("file_path", "unknown")
-                    desc = f"Writing to {file_path}" if name == "write_file" else file_path
+                    desc = file_path
                     
                     diff_text = turn.result
                     if not diff_text.startswith("Index:"):
@@ -320,7 +320,7 @@ class GeminiCliAdapter(ToolAdapter):
                 call_id = f"{name}_{int(datetime.now().timestamp() * 1000)}_0"
                 tool_call = {
                     "id": call_id,
-                    "name": name,
+                    "name": name, 
                     "displayName": disp_name,
                     "description": desc,
                     "args": args,
