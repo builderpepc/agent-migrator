@@ -266,30 +266,27 @@ class GeminiCliAdapter(ToolAdapter):
                     "content": [{"text": turn.text}]
                 })
             elif isinstance(turn, ToolCallMessage):
-                name = turn.name
+                raw_name = turn.name
                 args = turn.input
                 result_val: Any = turn.result
                 res_display: Any = turn.result
                 kind = "other"
-                disp_name = name
+                disp_name = raw_name
                 desc = ""
 
-                if name == "run_shell_command":
-                    name = "run_shell_command"
+                if raw_name == "run_shell_command":
                     disp_name = "Shell"
                     kind = "execute"
                     cmd = args.get("command", "")
-                    # Description must match Gemini's specific format for UI rendering
                     desc = f"{cmd} [current working directory {project_root}]"
-                    # resultDisplay should be raw string for 0.37.1
                     res_display = turn.result
-                elif name in ("replace", "write_file"):
+                elif raw_name in ("replace", "write_file"):
                     kind = "edit"
-                    disp_name = "Edit" if name == "replace" else "WriteFile"
+                    disp_name = "Edit" if raw_name == "replace" else "WriteFile"
                     file_path = args.get("file_path", "unknown")
                     desc = file_path
                     diff_text = turn.result
-                    if name == "write_file" and not diff_text.startswith("---"):
+                    if raw_name == "write_file" and not diff_text.startswith("---"):
                         lines = diff_text.splitlines()
                         diff_text = f"--- /dev/null\n+++ {file_path}\n@@ -0,0 +1,{len(lines)} @@\n" + "\n".join(f"+{l}" for l in lines)
                     res_display = {
@@ -297,15 +294,12 @@ class GeminiCliAdapter(ToolAdapter):
                         "filePath": str(project_root / file_path),
                         "originalContent": "", "newContent": ""
                     }
-                    name = "replace"
-                elif name == "read_file":
-                    name = "read_file"
+                elif raw_name == "read_file":
                     disp_name = "ReadFile"
                     kind = "read"
                     desc = args.get("file_path", "unknown")
                     res_display = turn.result
-                elif name in ("codebase_investigator", "generalist"):
-                    name = "invoke_agent"
+                elif raw_name in ("codebase_investigator", "generalist"):
                     disp_name = "Agent"
                     kind = "agent"
                     desc = args.get("objective", args.get("request", ""))
@@ -314,24 +308,22 @@ class GeminiCliAdapter(ToolAdapter):
                         "recentActivity": [{"id": str(uuid.uuid4()), "type": "thought", "content": turn.result, "status": "completed"}],
                         "state": "completed", "result": turn.result
                     }
-                elif name in ("EnterPlanMode", "EnterPlanModeTool"):
-                    name = "enter_plan_mode"
+                elif raw_name in ("EnterPlanMode", "EnterPlanModeTool"):
                     disp_name = "Enter Plan Mode"
                     kind = "plan"
                     desc = args.get("reason", "")
-                elif name in ("ExitPlanMode", "ExitPlanModeTool"):
-                    name = "exit_plan_mode"
+                elif raw_name in ("ExitPlanMode", "ExitPlanModeTool"):
                     disp_name = "Exit Plan Mode"
                     kind = "plan"
                     desc = args.get("plan_filename", "")
 
                 tool_call = {
                     "id": f"tc-{uuid.uuid4().hex[:8]}",
-                    "name": name,
+                    "name": disp_name, # Critical: ToolMessage uses 'name' prop for the bolded part
                     "displayName": disp_name,
                     "description": desc,
                     "args": args,
-                    "result": [{"functionResponse": {"name": name, "response": {"output": result_val}}}],
+                    "result": [{"functionResponse": {"name": raw_name, "response": {"output": result_val}}}],
                     "resultDisplay": res_display,
                     "status": "success",
                     "timestamp": ts_iso,

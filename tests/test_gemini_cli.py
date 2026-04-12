@@ -100,7 +100,7 @@ class TestGeminiCliAdapter(unittest.TestCase):
             self.assertEqual(data["projectHash"], _get_project_hash(self.project_root))
 
     def test_write_conversation_maps_tools(self):
-        """Should map CC tools to Gemini CLI 0.37.1 structures with descriptions."""
+        """Should map CC tools to Gemini CLI 0.37.1 bolded name and description."""
         adapter = GeminiCliAdapter()
         info = ConversationInfo(
             id="tool-test", name="Tool Test",
@@ -124,19 +124,16 @@ class TestGeminiCliAdapter(unittest.TestCase):
             self.assertEqual(len(tools), 3)
             
             # Shell tool mapping
-            self.assertEqual(tools[0]["name"], "run_shell_command")
-            self.assertEqual(tools[0]["displayName"], "Shell")
-            self.assertTrue(tools[0]["description"].startswith("whoami [current working directory"))
+            self.assertEqual(tools[0]["name"], "Shell") # Bolded part
+            self.assertTrue(tools[0]["description"].startswith("whoami [current working directory")) # Header text
             self.assertEqual(tools[0]["resultDisplay"], "laptop-user")
             
             # Read tool mapping
-            self.assertEqual(tools[1]["name"], "read_file")
-            self.assertEqual(tools[1]["displayName"], "ReadFile")
+            self.assertEqual(tools[1]["name"], "ReadFile")
             self.assertEqual(tools[1]["description"], "test.py")
             
             # Edit tool mapping
-            self.assertEqual(tools[2]["name"], "replace")
-            self.assertEqual(tools[2]["displayName"], "Edit")
+            self.assertEqual(tools[2]["name"], "Edit")
             self.assertEqual(tools[2]["description"], "main.py")
             self.assertIsInstance(tools[2]["resultDisplay"], dict)
             self.assertEqual(tools[2]["resultDisplay"]["fileDiff"], "--- diff ---")
