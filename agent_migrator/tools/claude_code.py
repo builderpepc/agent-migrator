@@ -607,7 +607,7 @@ class ClaudeCodeAdapter(ToolAdapter):
                                 {
                                     "type": "tool_result",
                                     "tool_use_id": tool_use_id,
-                                    "content": [{"type": "text", "text": tc.result}],
+                                    "content": tc.result,
                                 }
                             ],
                         }
@@ -670,7 +670,7 @@ class ClaudeCodeAdapter(ToolAdapter):
                                         {
                                             "type": "tool_result",
                                             "tool_use_id": tuid,
-                                            "content": [{"type": "text", "text": tc.result}],
+                                            "content": tc.result,
                                         }                                    ],
                                 }
                                 result_record["sourceToolAssistantUUID"] = asst_uuid

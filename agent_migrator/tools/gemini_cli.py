@@ -162,21 +162,30 @@ class GeminiCliAdapter(ToolAdapter):
                 # Normalize arguments to canonical snake_case intermediary format
                 args = {}
                 for k, v in raw_args.items():
-                    # Map common camelCase to snake_case
                     nk = k
                     if k == "filePath": nk = "file_path"
                     elif k == "oldString": nk = "old_string"
                     elif k == "newString": nk = "new_string"
                     elif k == "replaceAll": nk = "replace_all"
+                    elif k == "dirPath": nk = "dir_path"
                     args[nk] = v
 
                 # Map back to intermediary tool names
                 norm_name = raw_name.lower()
-                if norm_name == "read_file": name = "Read"
-                elif norm_name == "replace": name = "Edit"
-                elif norm_name == "write_file": name = "Write"
-                elif norm_name == "run_shell_command": name = "Bash"
-                elif norm_name == "grep_search": name = "Grep"
+                if norm_name == "read_file": 
+                    name = "Read"
+                    args["file_path"] = args.get("file_path", args.get("filePath", ""))
+                elif norm_name == "replace": 
+                    name = "Edit"
+                    args["file_path"] = args.get("file_path", args.get("filePath", ""))
+                elif norm_name == "write_file": 
+                    name = "Write"
+                    args["file_path"] = args.get("file_path", args.get("filePath", ""))
+                elif norm_name == "run_shell_command": 
+                    name = "Bash"
+                elif norm_name == "grep_search": 
+                    name = "Grep"
+                    args["file_path"] = args.get("dir_path", args.get("path", args.get("file_path", ".")))
                 elif norm_name == "glob": name = "Glob"
                 elif norm_name in ("invoke_agent", "codebase_investigator", "generalist"): name = "Agent"
                 elif norm_name == "exitplanmode": name = "ExitPlanMode"
@@ -193,29 +202,52 @@ class GeminiCliAdapter(ToolAdapter):
                 if not res_val:
                     res_blocks = tc.get("result", [])
                     if isinstance(res_blocks, list):
+                        combined_parts = []
                         for block in res_blocks:
                             if not isinstance(block, dict): continue
                             if "functionResponse" in block:
                                 fr = block["functionResponse"]
                                 resp = fr.get("response", {})
                                 if isinstance(resp, dict):
-                                    res_val = resp.get("output", str(resp))
+                                    # Handle Bash output/error specifically for tags
+                                    if name == "Bash":
+                                        stdout = resp.get("output", "")
+                                        stderr = resp.get("error", "")
+                                        tagged = ""
+                                        if stdout: tagged += f"<bash-stdout>\n{stdout}\n</bash-stdout>"
+                                        if stderr: tagged += f"<bash-stderr>\n{stderr}\n</bash-stderr>"
+                                        if tagged: combined_parts.append(tagged)
+                                    else:
+                                        stdout = resp.get("output", "")
+                                        stderr = resp.get("error", "")
+                                        part = "\n".join(filter(None, [stdout, stderr]))
+                                        if part: combined_parts.append(part)
                                 else:
-                                    res_val = str(resp)
-                                if res_val: break
+                                    combined_parts.append(str(resp))
                             elif "parts" in block:
                                 parts = block["parts"]
                                 if isinstance(parts, list):
-                                    res_val = "\n".join(p.get("text", "") for p in parts if isinstance(p, dict) and "text" in p)
-                                    if res_val: break
+                                    p_text = "\n".join(p.get("text", "") for p in parts if isinstance(p, dict) and "text" in p)
+                                    if p_text: combined_parts.append(p_text)
+                        res_val = "\n".join(combined_parts)
                     if not res_val:
                         res_val = str(res_blocks) if res_blocks else ""
                 
                 if isinstance(res_val, dict):
-                    # Priority: newContent (Write), fileDiff (Edit), output (Bash), summary (Subagent)
                     res_val = res_val.get("newContent") or res_val.get("fileDiff") or res_val.get("output") or res_val.get("summary") or json.dumps(res_val)
 
-                messages.append(ToolCallMessage(name=name, input=args, result=str(res_val), timestamp=ts))
+                result_text = str(res_val)
+                if result_text.startswith("Output: "):
+                    result_text = result_text[len("Output: "):].strip()
+                if "Process Group PGID:" in result_text:
+                    import re
+                    result_text = re.sub(r"\n?Process Group PGID: \d+", "", result_text).strip()
+
+                # Ensure Bash results are tagged even if they came from resultDisplay
+                if name == "Bash" and not result_text.startswith("<bash-"):
+                    result_text = f"<bash-stdout>\n{result_text}\n</bash-stdout>"
+
+                messages.append(ToolCallMessage(name=name, input=args, result=result_text, timestamp=ts))
 
     def write_conversation(self, conv: Conversation, project_path: Path, **kwargs) -> str:
         project_root = _find_project_root(project_path)
