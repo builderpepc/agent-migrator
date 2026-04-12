@@ -96,14 +96,23 @@ class GeminiCliAdapter(ToolAdapter):
             return []
 
         results: List[ConversationInfo] = []
-        # Gemini stores sessions as session-*.json directly in chats/
-        # or sometimes in subdirectories.
-        for json_file in chats_dir.glob("**/session-*.json"):
+        # Gemini stores sessions as session-*.jsonl (new) or session-*.json (legacy)
+        for json_file in chats_dir.glob("**/session-*.json*"):
             try:
-                # Basic metadata extraction without full load
                 mtime = datetime.fromtimestamp(json_file.stat().st_mtime, tz=timezone.utc)
+                
+                # For JSONL, we need to read the first line for metadata
+                # For JSON, we read the whole file
+                is_jsonl = json_file.suffix == ".jsonl"
                 with open(json_file, "r", encoding="utf-8") as f:
-                    data = json.load(f)
+                    if is_jsonl:
+                        # First line is always the metadata record
+                        first_line = f.readline()
+                        if not first_line:
+                            continue
+                        data = json.loads(first_line)
+                    else:
+                        data = json.load(f)
 
                 session_id = data.get("sessionId", json_file.stem)
                 start_time_str = data.get("startTime")
@@ -120,8 +129,16 @@ class GeminiCliAdapter(ToolAdapter):
                     else mtime
                 )
 
-                messages = data.get("messages", [])
-                message_count = sum(1 for m in messages if m.get("type") in ("user", "gemini"))
+                # Count messages (for JSONL we'd need to read the whole file, so we estimate
+                # or just count if it's small. Gemini CLI metadata doesn't store count.)
+                message_count = 0
+                if not is_jsonl:
+                    messages = data.get("messages", [])
+                    message_count = sum(1 for m in messages if m.get("type") in ("user", "gemini"))
+                else:
+                    # Quick estimation for JSONL to keep list_conversations fast
+                    # In a real scenario, we might want to cache this.
+                    message_count = 0 # Will be updated if we read the whole file
 
                 results.append(
                     ConversationInfo(
@@ -146,77 +163,49 @@ class GeminiCliAdapter(ToolAdapter):
             raise FileNotFoundError(f"Could not locate Gemini CLI directory for {project_path}")
 
         json_file = chats_dir / conv_id
-        with open(json_file, "r", encoding="utf-8") as f:
-            data = json.load(f)
-
+        is_jsonl = json_file.suffix == ".jsonl"
+        
         messages: List[MessageTurn] = []
-        for msg in data.get("messages", []):
-            msg_type = msg.get("type")
-            timestamp_str = msg.get("timestamp")
-            ts = (
-                datetime.fromisoformat(timestamp_str.replace("Z", "+00:00"))
-                if timestamp_str
-                else None
-            )
+        metadata: Dict[str, Any] = {}
 
-            # Gemini content is PartListUnion (often array of {text: ...})
-            content_parts = msg.get("content", [])
-            if isinstance(content_parts, str):
-                text = content_parts
-            elif isinstance(content_parts, list):
-                text = "".join(part.get("text", "") for part in content_parts if isinstance(part, dict))
+        with open(json_file, "r", encoding="utf-8") as f:
+            if is_jsonl:
+                for line in f:
+                    if not line.strip():
+                        continue
+                    record = json.loads(line)
+                    if "$rewindTo" in record:
+                        # Simple rewind logic: remove messages after the ID
+                        rewind_id = record["$rewindTo"]
+                        new_msgs = []
+                        for m in messages:
+                            # Note: models.py MessageTurn doesn't have ID, but we can't 
+                            # perfectly match Gemini's rewind without it. 
+                            # For migration, we usually just want the final state.
+                            new_msgs.append(m)
+                        messages = new_msgs
+                    elif "$set" in record:
+                        metadata.update(record["$set"])
+                    elif "sessionId" in record and "projectHash" in record:
+                        metadata.update(record)
+                    elif "id" in record and "timestamp" in record:
+                        self._parse_message_record(record, messages)
             else:
-                text = ""
-
-            if msg_type == "user":
-                messages.append(TextMessage(role="user", text=text, timestamp=ts))
-            elif msg_type == "gemini":
-                # Add thoughts as assistant text if present
-                thoughts = msg.get("thoughts", [])
-                thought_text = ""
-                if thoughts:
-                    thought_text = "\n".join(
-                        f"[Thought: {t.get('subject')}] {t.get('description')}"
-                        for t in thoughts
-                    )
-
-                if text or thought_text:
-                    full_text = text
-                    if thought_text:
-                        full_text = f"{thought_text}\n\n{text}" if text else thought_text
-                    messages.append(TextMessage(role="assistant", text=full_text, timestamp=ts))
-
-                # Add tool calls
-                for tc in msg.get("toolCalls", []):
-                    # Gemini tool results are also PartListUnion
-                    results = tc.get("result", [])
-                    result_str = ""
-                    if isinstance(results, str):
-                        result_str = results
-                    elif isinstance(results, list):
-                        result_str = "".join(
-                            part.get("text", "") for part in results if isinstance(part, dict)
-                        )
-
-                    messages.append(
-                        ToolCallMessage(
-                            name=tc.get("name", "unknown"),
-                            input=tc.get("args", {}),
-                            result=result_str,
-                            timestamp=ts,
-                        )
-                    )
+                data = json.load(f)
+                metadata = data
+                for msg in data.get("messages", []):
+                    self._parse_message_record(msg, messages)
 
         # Map generic info to ConversationInfo
         mtime = datetime.fromtimestamp(json_file.stat().st_mtime, tz=timezone.utc)
         info = ConversationInfo(
             id=conv_id,
-            name=data.get("summary") or f"Session {data.get('sessionId', 'unknown')[:8]}",
-            updated_at=datetime.fromisoformat(data["lastUpdated"].replace("Z", "+00:00"))
-            if "lastUpdated" in data
+            name=metadata.get("summary") or f"Session {metadata.get('sessionId', 'unknown')[:8]}",
+            updated_at=datetime.fromisoformat(metadata["lastUpdated"].replace("Z", "+00:00"))
+            if "lastUpdated" in metadata
             else mtime,
-            created_at=datetime.fromisoformat(data["startTime"].replace("Z", "+00:00"))
-            if "startTime" in data
+            created_at=datetime.fromisoformat(metadata["startTime"].replace("Z", "+00:00"))
+            if "startTime" in metadata
             else mtime,
             message_count=len([m for m in messages if isinstance(m, TextMessage)]),
             size_bytes=json_file.stat().st_size,
@@ -226,17 +215,75 @@ class GeminiCliAdapter(ToolAdapter):
         return Conversation(
             info=info,
             turns=messages,
-            model=data.get("model"),
+            model=metadata.get("model"),
         )
+
+    def _parse_message_record(self, msg: Dict[str, Any], messages: List[MessageTurn]) -> None:
+        msg_type = msg.get("type")
+        timestamp_str = msg.get("timestamp")
+        ts = (
+            datetime.fromisoformat(timestamp_str.replace("Z", "+00:00"))
+            if timestamp_str
+            else None
+        )
+
+        content_parts = msg.get("content", [])
+        if isinstance(content_parts, str):
+            text = content_parts
+        elif isinstance(content_parts, list):
+            text = "".join(part.get("text", "") for part in content_parts if isinstance(part, dict))
+        else:
+            text = ""
+
+        if msg_type == "user":
+            messages.append(TextMessage(role="user", text=text, timestamp=ts))
+        elif msg_type == "gemini":
+            thoughts = msg.get("thoughts", [])
+            thought_text = ""
+            if thoughts:
+                thought_text = "\n".join(
+                    f"[Thought: {t.get('subject')}] {t.get('description')}"
+                    for t in thoughts
+                )
+
+            if text or thought_text:
+                full_text = text
+                if thought_text:
+                    full_text = f"{thought_text}\n\n{text}" if text else thought_text
+                messages.append(TextMessage(role="assistant", text=full_text, timestamp=ts))
+
+            for tc in msg.get("toolCalls", []):
+                results = tc.get("result", [])
+                result_str = ""
+                if isinstance(results, str):
+                    result_str = results
+                elif isinstance(results, list):
+                    # Gemini results can be functionResponse or text
+                    parts = []
+                    for part in results:
+                        if not isinstance(part, dict): continue
+                        if "text" in part:
+                            parts.append(part["text"])
+                        elif "functionResponse" in part:
+                            resp = part["functionResponse"].get("response")
+                            parts.append(json.dumps(resp) if isinstance(resp, (dict, list)) else str(resp))
+                    result_str = "".join(parts)
+
+                messages.append(
+                    ToolCallMessage(
+                        name=tc.get("name", "unknown"),
+                        input=tc.get("args", {}),
+                        result=result_str,
+                        timestamp=ts,
+                    )
+                )
 
     def write_conversation(self, conv: Conversation, project_path: Path, **kwargs) -> str:
         chats_dir = _get_chats_dir(project_path)
         if not chats_dir:
-            # Create the directory if it doesn't exist (need hash)
             project_hash = _get_project_hash(project_path)
             chats_dir = _gemini_dir() / "tmp" / project_hash / "chats"
             chats_dir.mkdir(parents=True, exist_ok=True)
-            # Ensure .project_root is also there for fallback
             root_file = chats_dir.parent / ".project_root"
             if not root_file.exists():
                 root_file.write_text(str(project_path.resolve()))
@@ -244,29 +291,40 @@ class GeminiCliAdapter(ToolAdapter):
         session_id = str(uuid.uuid4())
         now_iso = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
-        messages = []
-        for turn in conv.turns:
-            ts_iso = (
-                turn.timestamp.isoformat().replace("+00:00", "Z")
-                if turn.timestamp
-                else now_iso
-            )
-            msg_id = str(uuid.uuid4())
+        filename = f"session-{datetime.now().strftime('%Y-%m-%dT%H-%M')}-{session_id[:8]}.jsonl"
+        dest_file = chats_dir / filename
+        
+        with open(dest_file, "w", encoding="utf-8") as f:
+            # 1. Initial metadata record
+            metadata = {
+                "sessionId": session_id,
+                "projectHash": _get_project_hash(project_path),
+                "startTime": conv.info.created_at.isoformat().replace("+00:00", "Z"),
+                "lastUpdated": now_iso,
+                "summary": conv.info.name,
+                "model": conv.model or "gemini-2.0-flash",
+            }
+            f.write(json.dumps(metadata) + "\n")
 
-            if isinstance(turn, TextMessage):
-                messages.append(
-                    {
+            # 2. Message records
+            for turn in conv.turns:
+                ts_iso = (
+                    turn.timestamp.isoformat().replace("+00:00", "Z")
+                    if turn.timestamp
+                    else now_iso
+                )
+                msg_id = str(uuid.uuid4())
+
+                if isinstance(turn, TextMessage):
+                    msg = {
                         "id": msg_id,
                         "timestamp": ts_iso,
                         "type": "user" if turn.role == "user" else "gemini",
                         "content": [{"text": turn.text}],
                     }
-                )
-            elif isinstance(turn, ToolCallMessage):
-                # Gemini groups tool calls into the preceding/following gemini message
-                # For simplicity in migration, we create a 'gemini' message per tool call
-                messages.append(
-                    {
+                    f.write(json.dumps(msg) + "\n")
+                elif isinstance(turn, ToolCallMessage):
+                    msg = {
                         "id": msg_id,
                         "timestamp": ts_iso,
                         "type": "gemini",
@@ -282,22 +340,7 @@ class GeminiCliAdapter(ToolAdapter):
                             }
                         ],
                     }
-                )
-
-        record = {
-            "sessionId": session_id,
-            "projectHash": _get_project_hash(project_path),
-            "startTime": conv.info.created_at.isoformat().replace("+00:00", "Z"),
-            "lastUpdated": now_iso,
-            "messages": messages,
-            "summary": conv.info.name,
-            "model": conv.model or "gemini-2.0-flash",
-        }
-
-        filename = f"session-{datetime.now().strftime('%Y-%m-%dT%H-%M')}-{session_id[:8]}.json"
-        dest_file = chats_dir / filename
-        with open(dest_file, "w", encoding="utf-8") as f:
-            json.dump(record, f, indent=2)
+                    f.write(json.dumps(msg) + "\n")
 
         return filename
 

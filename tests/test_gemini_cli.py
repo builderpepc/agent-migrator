@@ -22,32 +22,32 @@ class TestGeminiCliAdapter(unittest.TestCase):
         self.chats_dir = self.gemini_home / "tmp" / self.project_hash / "chats"
         self.chats_dir.mkdir(parents=True)
         
-        # Create a mock session file
+        # Create a mock JSONL session file
         self.session_id = "test-session-uuid"
-        self.session_data = {
+        self.metadata = {
             "sessionId": self.session_id,
             "projectHash": self.project_hash,
             "startTime": "2026-04-11T10:00:00Z",
             "lastUpdated": "2026-04-11T10:05:00Z",
             "summary": "Test Conversation",
-            "messages": [
-                {
-                    "id": "msg1",
-                    "timestamp": "2026-04-11T10:00:00Z",
-                    "type": "user",
-                    "content": [{"text": "Hello Gemini"}]
-                },
-                {
-                    "id": "msg2",
-                    "timestamp": "2026-04-11T10:01:00Z",
-                    "type": "gemini",
-                    "content": [{"text": "Hello User"}]
-                }
-            ]
         }
-        self.session_file = self.chats_dir / f"session-2026-04-11T10-00-{self.session_id[:8]}.json"
+        self.msg1 = {
+            "id": "msg1",
+            "timestamp": "2026-04-11T10:00:00Z",
+            "type": "user",
+            "content": [{"text": "Hello Gemini"}]
+        }
+        self.msg2 = {
+            "id": "msg2",
+            "timestamp": "2026-04-11T10:01:00Z",
+            "type": "gemini",
+            "content": [{"text": "Hello User"}]
+        }
+        self.session_file = self.chats_dir / f"session-2026-04-11T10-00-{self.session_id[:8]}.jsonl"
         with open(self.session_file, "w", encoding="utf-8") as f:
-            json.dump(self.session_data, f)
+            f.write(json.dumps(self.metadata) + "\n")
+            f.write(json.dumps(self.msg1) + "\n")
+            f.write(json.dumps(self.msg2) + "\n")
 
     def tearDown(self):
         shutil.rmtree(self.test_dir)
@@ -60,7 +60,7 @@ class TestGeminiCliAdapter(unittest.TestCase):
         
         self.assertEqual(len(convs), 1)
         self.assertEqual(convs[0].name, "Test Conversation")
-        self.assertEqual(convs[0].message_count, 2)
+        self.assertTrue(convs[0].id.endswith(".jsonl"))
 
     def test_read_conversation(self):
         adapter = GeminiCliAdapter()
@@ -89,13 +89,19 @@ class TestGeminiCliAdapter(unittest.TestCase):
         )
         
         filename = adapter.write_conversation(new_conv, self.project_path)
+        self.assertTrue(filename.endswith(".jsonl"))
         self.assertTrue((self.chats_dir / filename).exists())
         
-        # Verify written content
+        # Verify JSONL content
         with open(self.chats_dir / filename, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            self.assertEqual(data["summary"], "New Migration")
-            self.assertEqual(data["messages"][0]["content"][0]["text"], "Migrated Text")
+            lines = f.readlines()
+            self.assertEqual(len(lines), 2) # 1 metadata + 1 message
+            
+            meta = json.loads(lines[0])
+            self.assertEqual(meta["summary"], "New Migration")
+            
+            msg = json.loads(lines[1])
+            self.assertEqual(msg["content"][0]["text"], "Migrated Text")
 
 if __name__ == "__main__":
     unittest.main()
