@@ -251,6 +251,14 @@ class GeminiCliAdapter(ToolAdapter):
                     result_text = re.sub(r"\n?Process Group PGID: \d+", "", result_text).strip()
 
                 messages.append(ToolCallMessage(name=name, input=args, result=result_text, timestamp=ts))
+                # If this was a Bash tool, we also want to emit it as a user TextMessage
+                # to ensure visibility in the CC UI, which parses these tags from plain text.
+                if name == "Bash":
+                    # We'll replace the ToolCallMessage we just added with TextMessages
+                    messages.pop()
+                    cmd = args.get("command", "")
+                    messages.append(TextMessage(role="user", text=f"<bash-input>{cmd}</bash-input>", timestamp=ts))
+                    messages.append(TextMessage(role="user", text=result_text, timestamp=ts))
 
     def write_conversation(self, conv: Conversation, project_path: Path, **kwargs) -> str:
         project_root = _find_project_root(project_path)
