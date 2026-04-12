@@ -271,18 +271,21 @@ class GeminiCliAdapter(ToolAdapter):
                 result_val: Any = turn.result
                 res_display: Any = turn.result
                 kind = "other"
+                
+                # Critical: 'name' field in session JSON is what's displayed in bold AND used for isShellTool check.
+                # 'description' field is the secondary text in the header.
                 disp_name = raw_name
                 desc = ""
 
                 if raw_name == "run_shell_command":
-                    disp_name = "Shell"
+                    disp_name = "Shell" # Matches SHELL_NAME constant
                     kind = "execute"
                     cmd = args.get("command", "")
                     desc = f"{cmd} [current working directory {project_root}]"
                     res_display = turn.result
                 elif raw_name in ("replace", "write_file"):
                     kind = "edit"
-                    disp_name = "Edit" if raw_name == "replace" else "WriteFile"
+                    disp_name = "Edit" # Matches EDIT_DISPLAY_NAME constant
                     file_path = args.get("file_path", "unknown")
                     desc = file_path
                     diff_text = turn.result
@@ -295,7 +298,7 @@ class GeminiCliAdapter(ToolAdapter):
                         "originalContent": "", "newContent": ""
                     }
                 elif raw_name == "read_file":
-                    disp_name = "ReadFile"
+                    disp_name = "ReadFile" # Matches READ_FILE_DISPLAY_NAME constant
                     kind = "read"
                     desc = args.get("file_path", "unknown")
                     res_display = turn.result
@@ -319,7 +322,7 @@ class GeminiCliAdapter(ToolAdapter):
 
                 tool_call = {
                     "id": f"tc-{uuid.uuid4().hex[:8]}",
-                    "name": disp_name, # Critical: ToolMessage uses 'name' prop for the bolded part
+                    "name": disp_name, # Critical: v0.37.1 UI uses 'name' for the bolded part
                     "displayName": disp_name,
                     "description": desc,
                     "args": args,
@@ -344,6 +347,7 @@ class GeminiCliAdapter(ToolAdapter):
             "kind": "main"
         }
 
+        # Write as .json (monolithic) for compatibility with Gemini CLI 0.37.1
         filename = f"session-{datetime.now().strftime('%Y-%m-%dT%H-%M')}-{session_id[:8]}.json"
         dest_file = chats_dir / filename
         with open(dest_file, "w", encoding="utf-8") as f:
