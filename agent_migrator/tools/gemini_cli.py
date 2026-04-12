@@ -202,6 +202,7 @@ class GeminiCliAdapter(ToolAdapter):
                 messages.append(TextMessage(role="assistant", text=full_text, timestamp=ts))
 
             for tc in msg.get("toolCalls", []):
+                # Try resultDisplay first, fallback to result
                 res_parts = tc.get("resultDisplay") or tc.get("result", [])
                 res_str = ""
                 if isinstance(res_parts, list):
@@ -263,23 +264,23 @@ class GeminiCliAdapter(ToolAdapter):
                 disp_name = raw_name
                 desc = ""
 
-                # Parity alignment with Gemini CLI 0.37.1
-                if raw_name == "run_shell_command":
+                # Robust mapping for Claude Code / Cursor / Gemini tool names
+                norm_name = raw_name.lower()
+                if norm_name in ("run_shell_command", "bash"):
                     name = "run_shell_command"
                     disp_name = "Shell"
                     kind = "execute"
                     cmd = args.get("command", "")
-                    # Match native description pattern strictly
                     desc = f"{cmd} [current working directory {project_root}]"
                     res_display = turn.result
-                elif raw_name in ("replace", "write_file"):
+                elif norm_name in ("replace", "edit", "write", "write_file"):
                     name = "replace"
                     kind = "edit"
                     disp_name = "Edit"
                     file_path = args.get("file_path", "unknown")
                     desc = file_path
                     diff_text = turn.result
-                    if raw_name == "write_file" and not diff_text.startswith("---"):
+                    if norm_name in ("write", "write_file") and not diff_text.startswith("---"):
                         lines = diff_text.splitlines()
                         diff_text = f"--- /dev/null\n+++ {file_path}\n@@ -0,0 +1,{len(lines)} @@\n" + "\n".join(f"+{l}" for l in lines)
                     res_display = {
@@ -287,32 +288,32 @@ class GeminiCliAdapter(ToolAdapter):
                         "filePath": str(project_root / file_path),
                         "originalContent": "", "newContent": ""
                     }
-                elif raw_name == "read_file":
+                elif norm_name in ("read_file", "read"):
                     name = "read_file"
                     disp_name = "ReadFile"
                     kind = "read"
                     desc = args.get("file_path", "unknown")
                     res_display = turn.result
-                elif raw_name in ("codebase_investigator", "generalist"):
+                elif norm_name in ("invoke_agent", "agent", "codebase_investigator", "generalist"):
                     name = "invoke_agent"
                     disp_name = "Agent"
                     kind = "agent"
-                    desc = args.get("objective", args.get("request", ""))
+                    desc = args.get("objective", args.get("request", args.get("prompt", "")))
                     res_display = {
                         "isSubagentProgress": True, "agentName": "Subagent",
                         "recentActivity": [{"id": str(uuid.uuid4()), "type": "thought", "content": turn.result, "status": "completed"}],
                         "state": "completed", "result": turn.result
                     }
-                elif raw_name in ("EnterPlanMode", "EnterPlanModeTool"):
+                elif norm_name in ("enter_plan_mode", "enterplanmode", "enterplanmodetool"):
                     name = "enter_plan_mode"
                     disp_name = "Enter Plan Mode"
                     kind = "plan"
                     desc = args.get("reason", "")
-                elif raw_name in ("ExitPlanMode", "ExitPlanModeTool"):
+                elif norm_name in ("exit_plan_mode", "exitplanmode", "exitplanmodetool"):
                     name = "exit_plan_mode"
                     disp_name = "Exit Plan Mode"
                     kind = "plan"
-                    desc = args.get("plan_filename", "")
+                    desc = args.get("plan_filename", args.get("plan", ""))
                 else:
                     name = raw_name
 
