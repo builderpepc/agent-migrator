@@ -50,7 +50,7 @@ def _find_project_root(path: Path) -> Path:
 
 
 def _get_project_id_from_registry(project_root: Path) -> Optional[str]:
-    """Reads ~/.gemini/projects.json to find the shortId assigned to this project."""
+    """Reads ~/.gemini/projects.json to find the shortId."""
     registry_path = _gemini_dir() / "projects.json"
     if not registry_path.exists():
         return None
@@ -68,7 +68,7 @@ def _get_project_id_from_registry(project_root: Path) -> Optional[str]:
 
 
 def _get_chats_dir(project_path: Path) -> Optional[Path]:
-    """Locate the Gemini CLI chats directory for the project."""
+    """Locate the Gemini CLI chats directory."""
     base_tmp = _gemini_dir() / "tmp"
     if not base_tmp.exists():
         return None
@@ -263,17 +263,14 @@ class GeminiCliAdapter(ToolAdapter):
                 kind = "other"
                 
                 # Parity alignment with Gemini CLI 0.37.1 UI
-                # name: bolded title in UI (Shell, Edit, ReadFile)
-                # canonical_name: internal ID used for functionResponse
                 canonical_name = raw_name
-                
                 norm_name = raw_name.lower()
+                
                 if norm_name in ("run_shell_command", "bash"):
                     name = "Shell"
                     canonical_name = "run_shell_command"
                     kind = "execute"
                     cmd = args.get("command", "")
-                    # Match native description pattern strictly for header rendering
                     desc = f"{cmd} [current working directory {project_root}]"
                     res_display = turn.result
                 elif norm_name in ("replace", "edit", "write", "write_file"):
@@ -282,25 +279,34 @@ class GeminiCliAdapter(ToolAdapter):
                     kind = "edit"
                     file_path = args.get("file_path", "unknown")
                     desc = file_path
-                    diff_text = turn.result
                     
-                    # Gemini CLI 0.37.1 DiffRenderer requires Index/=== header AND @@ hunk header
-                    if not diff_text.startswith("@@") and not diff_text.startswith("Index:"):
-                        lines = diff_text.splitlines()
+                    # Gemini CLI 0.37.1 DiffRenderer strictly requires full headers
+                    new_content = args.get("content", args.get("new_string", ""))
+                    if new_content:
+                        lines = new_content.splitlines()
                         diff_text = (
                             f"Index: {file_path}\n"
                             f"===================================================================\n"
                             f"--- {file_path}\tOriginal\n"
                             f"+++ {file_path}\tWritten\n"
-                            f"@@ -0,0 +1,{len(lines)} @@\n"
+                            f"@@ -1,1 +1,{len(lines)} @@\n"
                         ) + "\n".join(f"+{l}" for l in lines)
-                    
-                    res_display = {
-                        "fileDiff": diff_text, "fileName": Path(file_path).name,
-                        "filePath": str(project_root / file_path),
-                        "originalContent": "", "newContent": turn.result,
-                        "isNewFile": True if norm_name == "write" else False
-                    }
+                        
+                        res_display = {
+                            "fileDiff": diff_text, "fileName": Path(file_path).name,
+                            "filePath": str(project_root / file_path),
+                            "originalContent": "", "newContent": new_content,
+                            "diffStat": {
+                                "model_added_lines": len(lines), "model_removed_lines": 0,
+                                "model_added_chars": len(new_content), "model_removed_chars": 0,
+                                "user_added_lines": 0, "user_removed_lines": 0,
+                                "user_added_chars": 0, "user_removed_chars": 0
+                            },
+                            "isNewFile": True if norm_name == "write" else False
+                        }
+                    else:
+                        # Fallback to result if no input content found
+                        res_display = turn.result
                 elif norm_name in ("read_file", "read"):
                     name = "ReadFile"
                     canonical_name = "read_file"
@@ -333,7 +339,7 @@ class GeminiCliAdapter(ToolAdapter):
                 call_id = f"{canonical_name}_{int(datetime.now().timestamp() * 1000)}_0"
                 tool_call = {
                     "id": call_id,
-                    "name": name, # v0.37.1 bolded display name
+                    "name": name, # v0.37.1 UI title
                     "displayName": name,
                     "description": desc,
                     "args": args,
