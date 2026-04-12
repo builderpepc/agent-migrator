@@ -156,8 +156,78 @@ class GeminiCliAdapter(ToolAdapter):
         elif msg_type == "gemini":
             if text: messages.append(TextMessage(role="assistant", text=text, timestamp=ts))
             for tc in msg.get("toolCalls", []):
-                res = tc.get("resultDisplay") or tc.get("result", "")
-                messages.append(ToolCallMessage(name=tc.get("name", "unknown"), input=tc.get("args", {}), result=str(res), timestamp=ts))
+                raw_name = tc.get("name", "unknown")
+                args = tc.get("args", {})
+                
+                # Map back to intermediary names (Claude Code style)
+                # Map names case-insensitively to be robust
+                norm_name = raw_name.lower()
+                if norm_name == "read_file": 
+                    name = "Read"
+                    args = {"filePath": args.get("file_path", args.get("filePath", ""))}
+                elif norm_name == "replace": 
+                    name = "Edit"
+                    args = {
+                        "filePath": args.get("file_path", args.get("filePath", "")),
+                        "oldString": args.get("old_string", args.get("oldString", "")),
+                        "newString": args.get("new_string", args.get("newString", "")),
+                        "replaceAll": args.get("replace_all", args.get("replaceAll", False))
+                    }
+                elif norm_name == "write_file": 
+                    name = "Write"
+                    args = {
+                        "filePath": args.get("file_path", args.get("filePath", "")),
+                        "content": args.get("content", "")
+                    }
+                elif norm_name == "run_shell_command": 
+                    name = "Bash"
+                elif norm_name == "grep_search": 
+                    name = "Grep"
+                    args = {
+                        "pattern": args.get("pattern", ""),
+                        "filePath": args.get("dir_path", args.get("path", args.get("filePath", ".")))
+                    }
+                elif norm_name == "glob": 
+                    name = "Glob"
+                elif norm_name in ("invoke_agent", "codebase_investigator", "generalist"): 
+                    name = "Agent"
+                elif norm_name == "exitplanmode":
+                    name = "ExitPlanMode"
+                elif norm_name == "taskcreate":
+                    name = "TaskCreate"
+                elif norm_name == "taskupdate":
+                    name = "TaskUpdate"
+                elif norm_name == "tasklist":
+                    name = "TaskList"
+                elif norm_name == "websearch":
+                    name = "WebSearch"
+                elif norm_name == "webfetch":
+                    name = "WebFetch"
+                else: 
+                    # Use capitalized name as a best guess for unknown tools
+                    name = raw_name[0].upper() + raw_name[1:] if raw_name else "Unknown"
+
+                # Extract result
+                res_val = tc.get("resultDisplay")
+                if not res_val:
+                    res_blocks = tc.get("result", [])
+                    if isinstance(res_blocks, list) and res_blocks:
+                        for block in res_blocks:
+                            if isinstance(block, dict) and "functionResponse" in block:
+                                resp = block["functionResponse"].get("response", {})
+                                if isinstance(resp, dict):
+                                    res_val = resp.get("output", str(resp))
+                                else:
+                                    res_val = str(resp)
+                                break
+                    if not res_val:
+                        res_val = str(res_blocks)
+                
+                if isinstance(res_val, dict):
+                    # If it's a structured result, try to get the most meaningful string
+                    res_val = res_val.get("newContent") or res_val.get("fileDiff") or res_val.get("output") or json.dumps(res_val)
+
+                messages.append(ToolCallMessage(name=name, input=args, result=str(res_val), timestamp=ts))
 
     def write_conversation(self, conv: Conversation, project_path: Path, **kwargs) -> str:
         project_root = _find_project_root(project_path)
@@ -181,7 +251,7 @@ class GeminiCliAdapter(ToolAdapter):
             current_turn_tools.clear()
 
         for turn in conv.turns:
-            ts_iso = turn.timestamp.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z" if turn.timestamp else now_iso
+            ts_iso = turn.timestamp.isoformat() if turn.timestamp else now_iso
             if isinstance(turn, TextMessage):
                 flush_tools()
                 messages.append({
@@ -199,15 +269,16 @@ class GeminiCliAdapter(ToolAdapter):
 
                 if raw_name in ("run_shell_command", "bash"):
                     name, disp_name = "run_shell_command", "Shell"
-                    desc = f"{args.get('command', '')} [current working directory {project_root}]"
+                    cmd = args.get("command", "")
+                    desc = f"{cmd} [current working directory {project_root}]"
                 elif raw_name in ("replace", "edit", "write", "write_file"):
                     name = "replace" if raw_name in ("replace", "edit") else "write_file"
                     disp_name = "Edit" if raw_name in ("replace", "edit") else "WriteFile"
-                    file_path = args.get("file_path", "unknown")
+                    file_path = args.get("file_path", args.get("filePath", "unknown"))
                     desc = f"Writing to {file_path}" if name == "write_file" else file_path
                     
-                    old_str = args.get("old_string", "")
-                    new_str = args.get("new_string", args.get("content", ""))
+                    old_str = args.get("old_string", args.get("oldString", ""))
+                    new_str = args.get("new_string", args.get("newString", args.get("content", "")))
                     
                     if old_str or new_str:
                         import difflib
@@ -256,11 +327,12 @@ class GeminiCliAdapter(ToolAdapter):
                     }
                 elif raw_name in ("read_file", "read"):
                     name, disp_name = "read_file", "ReadFile"
-                    desc = args.get("file_path", "unknown")
+                    file_path = args.get("file_path", args.get("filePath", "unknown"))
+                    desc = file_path
                 elif raw_name in ("grep_search", "grep"):
                     name, disp_name = "grep_search", "GrepSearch"
                     pattern = args.get("pattern", "")
-                    path = args.get("dir_path", args.get("path", "."))
+                    path = args.get("dir_path", args.get("path", args.get("filePath", ".")))
                     desc = f"'{pattern}' in {path}"
                 elif raw_name in ("glob",):
                     name, disp_name = "glob", "Glob"
