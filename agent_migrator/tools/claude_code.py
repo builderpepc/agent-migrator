@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import difflib
-import html as _html
 import json
 import os
 import re
@@ -27,10 +25,6 @@ def _claude_dir() -> Path:
 
 def _projects_dir() -> Path:
     return _claude_dir() / "projects"
-
-
-def _cc_plans_dir() -> Path:
-    return _claude_dir() / "plans"
 
 
 def encode_project_path(project_path: Path) -> str:
@@ -69,13 +63,12 @@ _CC_INTERNAL_CONTENT_RE = re.compile(
     r'^<(?:'
     r'command-(?:name|message|args)|'          # slash commands: /exit, /clear, etc.
     r'local-command-(?:caveat|stdout|stderr)|' # local command wrappers
+    r'bash-(?:input|stdout|stderr)|'           # bash tool blocks
     r'anysphere-remote-filesystem-content|'    # remote file content
     r'function_calls|result'                   # tool call wrappers
     r')[\s>]',
     re.IGNORECASE,
 )
-
-_BASH_TAG_RE = re.compile(r'<(bash-input|bash-stdout|bash-stderr)>([\s\S]*?)</\1>', re.IGNORECASE)
 
 
 def _extract_json_string_field(text: str, key: str) -> str | None:
@@ -245,49 +238,6 @@ def _count_message_lines(path: Path) -> int:
     return count
 
 
-def _structured_patch(old_string: str, new_string: str) -> list[dict]:
-    """
-    Compute a structuredPatch list in the format CC uses for Edit toolUseResult.
-    Each hunk: {oldStart, oldLines, newStart, newLines, lines: ["-old", "+new", " ctx"]}
-    """
-    old_lines = old_string.splitlines()
-    new_lines = new_string.splitlines()
-    matcher = difflib.SequenceMatcher(None, old_lines, new_lines, autojunk=False)
-    hunks = []
-    for group in matcher.get_grouped_opcodes(3):
-        old_start = group[0][1] + 1  # 1-based
-        new_start = group[0][3] + 1
-        old_count = 0
-        new_count = 0
-        lines: list[str] = []
-        for op, i1, i2, j1, j2 in group:
-            if op == "equal":
-                for line in old_lines[i1:i2]:
-                    lines.append(f" {line}")
-                old_count += i2 - i1
-                new_count += i2 - i1
-            elif op in ("delete", "replace"):
-                for line in old_lines[i1:i2]:
-                    lines.append(f"-{line}")
-                old_count += i2 - i1
-                if op == "replace":
-                    for line in new_lines[j1:j2]:
-                        lines.append(f"+{line}")
-                    new_count += j2 - j1
-            elif op == "insert":
-                for line in new_lines[j1:j2]:
-                    lines.append(f"+{line}")
-                new_count += j2 - j1
-        hunks.append({
-            "oldStart": old_start,
-            "oldLines": old_count,
-            "newStart": new_start,
-            "newLines": new_count,
-            "lines": lines,
-        })
-    return hunks
-
-
 class ClaudeCodeAdapter(ToolAdapter):
     name = "Claude Code"
     tool_id = "claude_code"
@@ -339,8 +289,6 @@ class ClaudeCodeAdapter(ToolAdapter):
 
         # Map tool_use_id -> ToolCallMessage (pending result)
         pending_tool_calls: dict[str, ToolCallMessage] = {}
-        # Bash mode: accumulate command from <bash-input> to combine with its output
-        pending_bash_cmd: str | None = None
 
         with open(jsonl_file, encoding="utf-8") as f:
             for line in f:
@@ -423,42 +371,12 @@ class ClaudeCodeAdapter(ToolAdapter):
                                         ))
                     elif isinstance(content, str):
                         text = content.strip()
-                        ts = _parse_timestamp(rec.get("timestamp"))
-                        if text.startswith("<bash-input>"):
-                            m = _BASH_TAG_RE.match(text)
-                            raw = m.group(2) if m else text
-                            pending_bash_cmd = _html.unescape(raw).replace("\r\n", "\n").strip()
-                        elif text.startswith("<bash-stdout") or text.startswith("<bash-stderr"):
-                            # Collect stdout and stderr from this record
-                            stdout = ""
-                            stderr = ""
-                            for m in _BASH_TAG_RE.finditer(text):
-                                cleaned = _html.unescape(m.group(2)).replace("\r\n", "\n").strip()
-                                if m.group(1).lower() == "bash-stdout":
-                                    stdout = cleaned
-                                elif m.group(1).lower() == "bash-stderr":
-                                    stderr = cleaned
-                            output = "\n".join(filter(None, [stdout, stderr]))
-                            # Combine with pending command into one message
-                            if pending_bash_cmd is not None:
-                                combined = f"$ {pending_bash_cmd}"
-                                if output:
-                                    combined += f"\n{output}"
-                                turns.append(TextMessage(role="user", text=combined, timestamp=ts))
-                                pending_bash_cmd = None
-                            elif output:
-                                turns.append(TextMessage(role="user", text=output, timestamp=ts))
-                        else:
-                            # Flush any orphaned pending command before moving on
-                            if pending_bash_cmd is not None:
-                                turns.append(TextMessage(role="user", text=f"$ {pending_bash_cmd}", timestamp=ts))
-                                pending_bash_cmd = None
-                            if text and not _CC_INTERNAL_CONTENT_RE.match(text):
-                                turns.append(TextMessage(
-                                    role="user",
-                                    text=text,
-                                    timestamp=ts,
-                                ))
+                        if text and not _CC_INTERNAL_CONTENT_RE.match(text):
+                            turns.append(TextMessage(
+                                role="user",
+                                text=text,
+                                timestamp=_parse_timestamp(rec.get("timestamp")),
+                            ))
 
         updated_at = _last_timestamp(jsonl_file) or datetime.fromtimestamp(
             jsonl_file.stat().st_mtime, tz=timezone.utc
@@ -474,41 +392,9 @@ class ClaudeCodeAdapter(ToolAdapter):
             size_bytes=jsonl_file.stat().st_size,
             source_tool=self.tool_id,
         )
+        return Conversation(info=info, turns=turns)
 
-        # Read associated plan: check the plan file first (most up-to-date),
-        # then fall back to the ExitPlanMode tool_use embedded in the transcript.
-        plan_content: str | None = None
-        slug = _extract_json_string_field(jsonl_file.read_text(encoding="utf-8", errors="replace"), "slug")
-        if slug:
-            plan_file = _cc_plans_dir() / f"{slug}.md"
-            if plan_file.exists():
-                plan_content = plan_file.read_text(encoding="utf-8").strip() or None
-        if plan_content is None:
-            for turn in turns:
-                if (
-                    isinstance(turn, ToolCallMessage)
-                    and turn.name in ("ExitPlanMode", "ExitPlanModeV2", "exit-plan-mode-v2")
-                    and turn.input.get("plan")
-                ):
-                    plan_content = turn.input["plan"].strip() or None
-                    break
-
-        # Extract the API model ID from the first assistant record.
-        model: str | None = None
-        for line in jsonl_file.read_text(encoding="utf-8", errors="replace").splitlines():
-            try:
-                rec = json.loads(line)
-            except Exception:
-                continue
-            if rec.get("type") == "assistant":
-                m = rec.get("message", {}).get("model", "")
-                if m and m != "<synthetic>":
-                    model = m
-                    break
-
-        return Conversation(info=info, turns=turns, plan_content=plan_content, model=model)
-
-    def write_conversation(self, conv: Conversation, project_path: Path, **kwargs) -> str:
+    def write_conversation(self, conv: Conversation, project_path: Path) -> str:
         encoded = encode_project_path(project_path.resolve())
         session_dir = _projects_dir() / encoded
         session_dir.mkdir(parents=True, exist_ok=True)
@@ -517,11 +403,8 @@ class ClaudeCodeAdapter(ToolAdapter):
         final_path = session_dir / f"{session_id}.jsonl"
         tmp_path = session_dir / f"{session_id}.jsonl.tmp"
 
-        # Pick a slug: use source slug or derive from name.
-        # Append a random suffix so migrated plan files don't collide with
-        # existing plans that share the same conversation name.
-        slug_base = re.sub(r"[^a-z0-9]+", "-", conv.info.name.lower()).strip("-") or session_id[:8]
-        slug = f"{slug_base}-{uuid.uuid4().hex[:8]}"
+        # Pick a slug: use source slug or derive from name
+        slug = re.sub(r"[^a-z0-9]+", "-", conv.info.name.lower()).strip("-") or session_id[:8]
 
         try:
             with open(tmp_path, "w", encoding="utf-8") as f:
@@ -549,30 +432,6 @@ class ClaudeCodeAdapter(ToolAdapter):
                     # mismatched tool_use/tool_result counts → API 400.
                     return f"msg_{uuid.uuid4().hex[:20]}"
 
-                def _tool_use_result(tc: "ToolCallMessage") -> dict | None:
-                    """Build a toolUseResult metadata block for file-writing tools."""
-                    if tc.name == "Write":
-                        return {
-                            "type": "create",
-                            "filePath": tc.input.get("file_path", ""),
-                            "content": tc.input.get("content", ""),
-                            "structuredPatch": [],
-                            "originalFile": None,
-                        }
-                    if tc.name == "Edit":
-                        old_str = tc.input.get("old_string", "")
-                        new_str = tc.input.get("new_string", "")
-                        return {
-                            "filePath": tc.input.get("file_path", ""),
-                            "oldString": old_str,
-                            "newString": new_str,
-                            "originalFile": old_str,
-                            "structuredPatch": _structured_patch(old_str, new_str),
-                            "userModified": False,
-                            "replaceAll": tc.input.get("replace_all", False),
-                        }
-                    return None
-
                 def _write_tool_batch(
                     tool_batch: list[tuple[str, "ToolCallMessage"]],
                     ts: str,
@@ -597,26 +456,22 @@ class ClaudeCodeAdapter(ToolAdapter):
                     f.write(json.dumps(asst_record) + "\n")
                     prev_uuid = asst_uuid
 
-                    # One user record per tool_result (matches native CC format)
-                    for tool_use_id, tc in tool_batch:
-                        result_uuid = str(uuid.uuid4())
-                        result_record = _make_base("user", result_uuid, ts)
-                        result_record["message"] = {
-                            "role": "user",
-                            "content": [
-                                {
-                                    "type": "tool_result",
-                                    "tool_use_id": tool_use_id,
-                                    "content": tc.result,
-                                }
-                            ],
-                        }
-                        result_record["sourceToolAssistantUUID"] = asst_uuid
-                        tur = _tool_use_result(tc)
-                        if tur is not None:
-                            result_record["toolUseResult"] = tur
-                        f.write(json.dumps(result_record) + "\n")
-                        prev_uuid = result_uuid
+                    # One user record with all tool_result blocks
+                    result_uuid = str(uuid.uuid4())
+                    result_record = _make_base("user", result_uuid, ts)
+                    result_record["message"] = {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": tool_use_id,
+                                "content": [{"type": "text", "text": tc.result}],
+                            }
+                            for tool_use_id, tc in tool_batch
+                        ],
+                    }
+                    f.write(json.dumps(result_record) + "\n")
+                    prev_uuid = result_uuid
 
                 turns = conv.turns
                 i = 0
@@ -661,25 +516,21 @@ class ClaudeCodeAdapter(ToolAdapter):
                         prev_uuid = asst_uuid
 
                         if tool_batch:
-                            for tuid, tc in tool_batch:
-                                result_uuid = str(uuid.uuid4())
-                                result_record = _make_base("user", result_uuid, ts)
-                                result_record["message"] = {
-                                    "role": "user",
-                                    "content": [
-                                        {
-                                            "type": "tool_result",
-                                            "tool_use_id": tuid,
-                                            "content": tc.result,
-                                        }
-                                    ],
-                                }
-                                result_record["sourceToolAssistantUUID"] = asst_uuid
-                                tur = _tool_use_result(tc)
-                                if tur is not None:
-                                    result_record["toolUseResult"] = tur
-                                f.write(json.dumps(result_record) + "\n")
-                                prev_uuid = result_uuid
+                            result_uuid = str(uuid.uuid4())
+                            result_record = _make_base("user", result_uuid, ts)
+                            result_record["message"] = {
+                                "role": "user",
+                                "content": [
+                                    {
+                                        "type": "tool_result",
+                                        "tool_use_id": tuid,
+                                        "content": [{"type": "text", "text": tc.result}],
+                                    }
+                                    for tuid, tc in tool_batch
+                                ],
+                            }
+                            f.write(json.dumps(result_record) + "\n")
+                            prev_uuid = result_uuid
 
                     else:
                         # ToolCallMessage not preceded by assistant text — collect the
@@ -699,15 +550,6 @@ class ClaudeCodeAdapter(ToolAdapter):
             if tmp_path.exists():
                 tmp_path.unlink()
             raise
-
-        # Write associated plan file if the conversation carried one.
-        # CC finds plans by looking for ~/.claude/plans/{slug}.md — writing
-        # it here is enough for the session to show the plan on next open.
-        if conv.plan_content:
-            plans_dir = _cc_plans_dir()
-            plans_dir.mkdir(parents=True, exist_ok=True)
-            plan_path = plans_dir / f"{slug}.md"
-            plan_path.write_text(conv.plan_content, encoding="utf-8")
 
         return session_id
 
