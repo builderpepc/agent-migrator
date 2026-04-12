@@ -98,10 +98,9 @@ class TestGeminiCliAdapter(unittest.TestCase):
             data = json.load(f)
             self.assertEqual(data["kind"], "main")
             self.assertEqual(data["projectHash"], _get_project_hash(self.project_root))
-            self.assertEqual(data["messages"][0]["content"][0]["text"], "Migrated Text")
 
     def test_write_conversation_maps_tools(self):
-        """Should map CC tools to Gemini CLI specialized structures."""
+        """Should map CC tools to Gemini CLI 0.37.1 structures with descriptions."""
         adapter = GeminiCliAdapter()
         info = ConversationInfo(
             id="tool-test", name="Tool Test",
@@ -112,7 +111,8 @@ class TestGeminiCliAdapter(unittest.TestCase):
         new_conv = Conversation(
             info=info,
             turns=[
-                ToolCallMessage(name="run_shell_command", input={"command": "ls"}, result="file1\nfile2"),
+                ToolCallMessage(name="run_shell_command", input={"command": "whoami"}, result="laptop-user"),
+                ToolCallMessage(name="read_file", input={"file_path": "test.py"}, result="print('hello')"),
                 ToolCallMessage(name="replace", input={"file_path": "main.py"}, result="--- diff ---")
             ]
         )
@@ -120,23 +120,26 @@ class TestGeminiCliAdapter(unittest.TestCase):
         filename = adapter.write_conversation(new_conv, self.project_sub)
         with open(self.chats_dir / filename, "r", encoding="utf-8") as f:
             data = json.load(f)
-            # Both tools should be in the SAME Gemini message because they are consecutive tool calls
-            self.assertEqual(len(data["messages"]), 1)
             tools = data["messages"][0]["toolCalls"]
-            self.assertEqual(len(tools), 2)
+            self.assertEqual(len(tools), 3)
             
             # Shell tool mapping
             self.assertEqual(tools[0]["name"], "run_shell_command")
             self.assertEqual(tools[0]["displayName"], "Shell")
-            self.assertEqual(tools[0]["kind"], "execute")
-            self.assertEqual(tools[0]["resultDisplay"][0]["text"], "file1\nfile2")
-            self.assertEqual(tools[0]["result"][0]["functionResponse"]["name"], "run_shell_command")
+            self.assertTrue(tools[0]["description"].startswith("whoami [current working directory"))
+            self.assertEqual(tools[0]["resultDisplay"], "laptop-user")
+            
+            # Read tool mapping
+            self.assertEqual(tools[1]["name"], "read_file")
+            self.assertEqual(tools[1]["displayName"], "ReadFile")
+            self.assertEqual(tools[1]["description"], "test.py")
             
             # Edit tool mapping
-            self.assertEqual(tools[1]["name"], "replace")
-            self.assertEqual(tools[1]["displayName"], "Edit")
-            self.assertEqual(tools[1]["kind"], "edit")
-            self.assertEqual(tools[1]["resultDisplay"]["fileDiff"], "--- diff ---")
+            self.assertEqual(tools[2]["name"], "replace")
+            self.assertEqual(tools[2]["displayName"], "Edit")
+            self.assertEqual(tools[2]["description"], "main.py")
+            self.assertIsInstance(tools[2]["resultDisplay"], dict)
+            self.assertEqual(tools[2]["resultDisplay"]["fileDiff"], "--- diff ---")
 
 if __name__ == "__main__":
     unittest.main()

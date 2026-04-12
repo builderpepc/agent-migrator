@@ -214,7 +214,15 @@ class GeminiCliAdapter(ToolAdapter):
                 res_parts = tc.get("resultDisplay") or tc.get("result", [])
                 res_str = ""
                 if isinstance(res_parts, list):
-                    res_str = "".join(p.get("text", "") for p in res_parts if isinstance(p, dict))
+                    # Check if it's AnsiOutput or PartListUnion
+                    if res_parts and isinstance(res_parts[0], dict) and "text" in res_parts[0]:
+                        res_str = "".join(p.get("text", "") for p in res_parts)
+                    else:
+                        # Maybe functionResponse wrap
+                        for part in res_parts:
+                            if isinstance(part, dict) and "functionResponse" in part:
+                                resp = part["functionResponse"].get("response", "")
+                                res_str = resp.get("output", str(resp)) if isinstance(resp, dict) else str(resp)
                 elif isinstance(res_parts, dict):
                     if "fileDiff" in res_parts: res_str = res_parts["fileDiff"]
                     elif "summary" in res_parts: res_str = res_parts["summary"]
@@ -270,8 +278,11 @@ class GeminiCliAdapter(ToolAdapter):
                     name = "run_shell_command"
                     disp_name = "Shell"
                     kind = "execute"
-                    desc = args.get("command", "")
-                    res_display = [{"text": turn.result}]
+                    cmd = args.get("command", "")
+                    # Description must match Gemini's specific format for UI rendering
+                    desc = f"{cmd} [current working directory {project_root}]"
+                    # resultDisplay should be raw string for 0.37.1
+                    res_display = turn.result
                 elif name in ("replace", "write_file"):
                     kind = "edit"
                     disp_name = "Edit" if name == "replace" else "WriteFile"
@@ -287,6 +298,12 @@ class GeminiCliAdapter(ToolAdapter):
                         "originalContent": "", "newContent": ""
                     }
                     name = "replace"
+                elif name == "read_file":
+                    name = "read_file"
+                    disp_name = "ReadFile"
+                    kind = "read"
+                    desc = args.get("file_path", "unknown")
+                    res_display = turn.result
                 elif name in ("codebase_investigator", "generalist"):
                     name = "invoke_agent"
                     disp_name = "Agent"
@@ -314,12 +331,12 @@ class GeminiCliAdapter(ToolAdapter):
                     "displayName": disp_name,
                     "description": desc,
                     "args": args,
-                    "result": [{"functionResponse": {"name": name, "response": result_val}}],
+                    "result": [{"functionResponse": {"name": name, "response": {"output": result_val}}}],
                     "resultDisplay": res_display,
                     "status": "success",
                     "timestamp": ts_iso,
                     "kind": kind,
-                    "renderOutputAsMarkdown": True
+                    "renderOutputAsMarkdown": (kind != "execute")
                 }
                 current_turn_tools.append((tool_call, ts_iso))
         flush_tools()
