@@ -120,19 +120,23 @@ class TestGeminiCliAdapter(unittest.TestCase):
         filename = adapter.write_conversation(new_conv, self.project_sub)
         with open(self.chats_dir / filename, "r", encoding="utf-8") as f:
             data = json.load(f)
+            # Both tools should be in the SAME Gemini message because they are consecutive tool calls
+            self.assertEqual(len(data["messages"]), 1)
             tools = data["messages"][0]["toolCalls"]
+            self.assertEqual(len(tools), 2)
             
             # Shell tool mapping
             self.assertEqual(tools[0]["name"], "run_shell_command")
+            self.assertEqual(tools[0]["displayName"], "Shell")
             self.assertEqual(tools[0]["kind"], "execute")
-            self.assertIsInstance(tools[0]["result"], list)
-            self.assertEqual(tools[0]["result"][0]["text"], "file1\nfile2")
+            self.assertEqual(tools[0]["resultDisplay"][0]["text"], "file1\nfile2")
+            self.assertEqual(tools[0]["result"][0]["functionResponse"]["name"], "run_shell_command")
             
             # Edit tool mapping
-            self.assertEqual(tools[1]["name"], "edit")
+            self.assertEqual(tools[1]["name"], "replace")
+            self.assertEqual(tools[1]["displayName"], "Edit")
             self.assertEqual(tools[1]["kind"], "edit")
-            self.assertIsInstance(tools[1]["result"], dict)
-            self.assertEqual(tools[1]["result"]["fileDiff"], "--- diff ---")
+            self.assertEqual(tools[1]["resultDisplay"]["fileDiff"], "--- diff ---")
 
 if __name__ == "__main__":
     unittest.main()

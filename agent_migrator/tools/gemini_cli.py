@@ -33,9 +33,6 @@ def _normalize_path(p: str) -> str:
     matching Gemini CLI's ProjectRegistry logic (mostly).
     """
     resolved = os.path.abspath(p)
-    # Gemini CLI's ProjectRegistry uses path.resolve().toLowerCase() on Windows
-    # but does NOT replace backslashes in the registry keys.
-    # We use forward slashes ONLY for internal comparison logic.
     normalized = resolved.replace("\\", "/")
     return normalized.lower()
 
@@ -45,9 +42,6 @@ def _get_project_hash(project_root: Path) -> str:
     Computes the project hash matching Gemini CLI's internal getProjectHash.
     On Windows, this uses BACKSLASHES because Gemini CLI uses process.cwd().
     """
-    # Gemini CLI 0.37.1 on Windows uses the raw path from path.resolve()
-    # which preserves backslashes and case (though some parts might lowercase).
-    # Based on empirical evidence, it uses the backslashed path.
     raw_path = str(project_root.resolve())
     return hashlib.sha256(raw_path.encode()).hexdigest()
 
@@ -62,7 +56,7 @@ def _find_project_root(path: Path) -> Path:
 
 
 def _get_project_id_from_registry(project_root: Path) -> Optional[str]:
-    """Reads ~/.gemini/projects.json to find the shortId."""
+    """Reads ~/.gemini/projects.json to find the shortId assigned to this project."""
     registry_path = _gemini_dir() / "projects.json"
     if not registry_path.exists():
         return None
@@ -72,7 +66,6 @@ def _get_project_id_from_registry(project_root: Path) -> Optional[str]:
         projects = data.get("projects", {})
         target_norm = _normalize_path(str(project_root))
         
-        # Search keys robustly
         for key, val in projects.items():
             if _normalize_path(key) == target_norm:
                 return val
@@ -82,33 +75,19 @@ def _get_project_id_from_registry(project_root: Path) -> Optional[str]:
 
 
 def _get_chats_dir(project_path: Path) -> Optional[Path]:
-    """Locate the Gemini CLI chats directory."""
+    """Locate the Gemini CLI chats directory for the project."""
     base_tmp = _gemini_dir() / "tmp"
     if not base_tmp.exists():
         return None
 
     project_root = _find_project_root(project_path)
+    project_id = _get_project_id_from_registry(project_root) or _get_project_hash(project_root)
     
-    # 1. Registry lookup (handles slugs and legacy hashes)
-    project_id = _get_project_id_from_registry(project_root)
-    if project_id:
-        chats_dir = base_tmp / project_id / "chats"
-        if chats_dir.exists():
-            return chats_dir
-
-    # 2. Direct hash lookup (backslashed)
-    project_hash = _get_project_hash(project_root)
-    chats_dir = base_tmp / project_hash / "chats"
-    if chats_dir.exists():
-        return chats_dir
-    
-    # 3. Fallback hash lookup (forward-slashed)
-    alt_hash = hashlib.sha256(str(project_root.resolve()).replace("\\", "/").lower().encode()).hexdigest()
-    chats_dir = base_tmp / alt_hash / "chats"
+    chats_dir = base_tmp / project_id / "chats"
     if chats_dir.exists():
         return chats_dir
 
-    # 4. Scan .project_root files
+    # Fallback: scan for .project_root ownership marker
     target_norm = _normalize_path(str(project_root))
     try:
         for p in base_tmp.iterdir():
@@ -155,7 +134,6 @@ class GeminiCliAdapter(ToolAdapter):
                 created_at = datetime.fromisoformat(data["startTime"].replace("Z", "+00:00")) if "startTime" in data else mtime
                 updated_at = datetime.fromisoformat(data["lastUpdated"].replace("Z", "+00:00")) if "lastUpdated" in data else mtime
 
-                # Count messages
                 message_count = 0
                 if not is_jsonl:
                     message_count = sum(1 for m in data.get("messages", []) if m.get("type") in ("user", "gemini"))
@@ -232,8 +210,17 @@ class GeminiCliAdapter(ToolAdapter):
                 messages.append(TextMessage(role="assistant", text=full_text, timestamp=ts))
 
             for tc in msg.get("toolCalls", []):
-                res_parts = tc.get("result", [])
-                res_str = "".join(p.get("text", "") for p in res_parts if isinstance(p, dict)) if isinstance(res_parts, list) else str(res_parts)
+                # Try resultDisplay first, fallback to result
+                res_parts = tc.get("resultDisplay") or tc.get("result", [])
+                res_str = ""
+                if isinstance(res_parts, list):
+                    res_str = "".join(p.get("text", "") for p in res_parts if isinstance(p, dict))
+                elif isinstance(res_parts, dict):
+                    if "fileDiff" in res_parts: res_str = res_parts["fileDiff"]
+                    elif "summary" in res_parts: res_str = res_parts["summary"]
+                    else: res_str = json.dumps(res_parts)
+                else: res_str = str(res_parts)
+                
                 messages.append(ToolCallMessage(name=tc.get("name", "unknown"), input=tc.get("args", {}), result=res_str, timestamp=ts))
 
     def write_conversation(self, conv: Conversation, project_path: Path, **kwargs) -> str:
@@ -251,92 +238,90 @@ class GeminiCliAdapter(ToolAdapter):
         now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
         messages = []
-        # Group consecutive tool calls into one gemini message
         current_turn_tools = []
         
         def flush_tools():
-            if not current_turn_tools:
-                return
-            ts_iso = current_turn_tools[0][1]
-            msg_id = str(uuid.uuid4())
+            if not current_turn_tools: return
             messages.append({
-                "id": msg_id, "timestamp": ts_iso, "type": "gemini", "content": [],
+                "id": str(uuid.uuid4()), "timestamp": current_turn_tools[0][1], "type": "gemini", "content": [],
                 "toolCalls": [t[0] for t in current_turn_tools]
             })
             current_turn_tools.clear()
 
         for turn in conv.turns:
             ts_iso = turn.timestamp.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z" if turn.timestamp else now_iso
-            msg_id = str(uuid.uuid4())
-
             if isinstance(turn, TextMessage):
                 flush_tools()
                 messages.append({
-                    "id": msg_id, "timestamp": ts_iso,
+                    "id": str(uuid.uuid4()), "timestamp": ts_iso,
                     "type": "user" if turn.role == "user" else "gemini",
                     "content": [{"text": turn.text}]
                 })
             elif isinstance(turn, ToolCallMessage):
-                # Map specialized tools for Gemini CLI 0.37.1 UI
                 name = turn.name
                 args = turn.input
-                result_display: Any = turn.result
+                result_val: Any = turn.result
+                res_display: Any = turn.result
                 kind = "other"
+                disp_name = name
+                desc = ""
 
                 if name == "run_shell_command":
                     name = "run_shell_command"
+                    disp_name = "Shell"
                     kind = "execute"
-                    result_display = [{"text": turn.result}]
+                    desc = args.get("command", "")
+                    res_display = [{"text": turn.result}]
                 elif name in ("replace", "write_file"):
                     kind = "edit"
+                    disp_name = "Edit" if name == "replace" else "WriteFile"
                     file_path = args.get("file_path", "unknown")
-                    file_name = Path(file_path).name
+                    desc = file_path
                     diff_text = turn.result
                     if name == "write_file" and not diff_text.startswith("---"):
                         lines = diff_text.splitlines()
                         diff_text = f"--- /dev/null\n+++ {file_path}\n@@ -0,0 +1,{len(lines)} @@\n" + "\n".join(f"+{l}" for l in lines)
-                    
-                    name = "edit"
-                    result_display = {
-                        "fileDiff": diff_text,
-                        "fileName": file_name,
+                    res_display = {
+                        "fileDiff": diff_text, "fileName": Path(file_path).name,
                         "filePath": str(project_root / file_path),
-                        "originalContent": "",
-                        "newContent": ""
+                        "originalContent": "", "newContent": ""
                     }
+                    name = "replace"
                 elif name in ("codebase_investigator", "generalist"):
-                    name = "agent"
+                    name = "invoke_agent"
+                    disp_name = "Agent"
                     kind = "agent"
-                    result_display = {
-                        "isSubagentProgress": True,
-                        "agentName": "Subagent",
-                        "recentActivity": [{
-                            "id": str(uuid.uuid4()),
-                            "type": "thought",
-                            "content": turn.result,
-                            "status": "completed"
-                        }],
-                        "state": "completed",
-                        "result": turn.result
+                    desc = args.get("objective", args.get("request", ""))
+                    res_display = {
+                        "isSubagentProgress": True, "agentName": "Subagent",
+                        "recentActivity": [{"id": str(uuid.uuid4()), "type": "thought", "content": turn.result, "status": "completed"}],
+                        "state": "completed", "result": turn.result
                     }
-                elif name == "EnterPlanMode":
+                elif name in ("EnterPlanMode", "EnterPlanModeTool"):
                     name = "enter_plan_mode"
+                    disp_name = "Enter Plan Mode"
                     kind = "plan"
-                elif name == "ExitPlanMode":
+                    desc = args.get("reason", "")
+                elif name in ("ExitPlanMode", "ExitPlanModeTool"):
                     name = "exit_plan_mode"
+                    disp_name = "Exit Plan Mode"
                     kind = "plan"
+                    desc = args.get("plan_filename", "")
 
                 tool_call = {
                     "id": f"tc-{uuid.uuid4().hex[:8]}",
                     "name": name,
+                    "displayName": disp_name,
+                    "description": desc,
                     "args": args,
-                    "result": result_display,
+                    "result": [{"functionResponse": {"name": name, "response": result_val}}],
+                    "resultDisplay": res_display,
                     "status": "success",
                     "timestamp": ts_iso,
-                    "kind": kind
+                    "kind": kind,
+                    "renderOutputAsMarkdown": True
                 }
                 current_turn_tools.append((tool_call, ts_iso))
-        
         flush_tools()
 
         record = {
@@ -350,12 +335,10 @@ class GeminiCliAdapter(ToolAdapter):
             "kind": "main"
         }
 
-        # Write as .json (monolithic) for compatibility with Gemini CLI 0.37.1
         filename = f"session-{datetime.now().strftime('%Y-%m-%dT%H-%M')}-{session_id[:8]}.json"
         dest_file = chats_dir / filename
         with open(dest_file, "w", encoding="utf-8") as f:
             json.dump(record, f, indent=2)
-
         return filename
 
     def delete_conversation(self, conv_id: str, project_path: Path) -> None:
