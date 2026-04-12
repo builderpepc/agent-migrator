@@ -68,7 +68,7 @@ def _get_project_id_from_registry(project_root: Path) -> Optional[str]:
 
 
 def _get_chats_dir(project_path: Path) -> Optional[Path]:
-    """Locate the Gemini CLI chats directory."""
+    """Locate the Gemini CLI chats directory for the project."""
     base_tmp = _gemini_dir() / "tmp"
     if not base_tmp.exists():
         return None
@@ -270,7 +270,7 @@ class GeminiCliAdapter(ToolAdapter):
                     desc = f"{cmd} [current working directory {project_root}]"
                     res_display = turn.result
                 elif norm_name in ("replace", "edit", "write", "write_file"):
-                    name = "replace" # Canonical name for ALL edits in 0.37.1
+                    name = "replace" # MUST be replace for native Edit bolding and DiffRenderer
                     disp_name = "Edit"
                     file_path = args.get("file_path", "unknown")
                     desc = file_path
@@ -296,7 +296,7 @@ class GeminiCliAdapter(ToolAdapter):
                             "user_added_lines": 0, "user_removed_lines": 0,
                             "user_added_chars": 0, "user_removed_chars": 0
                         },
-                        "isNewFile": True if norm_name == "write" else False
+                        "isNewFile": True if norm_name in ("write", "write_file") else False
                     }
                 elif norm_name in ("read_file", "read"):
                     name = "read_file"
