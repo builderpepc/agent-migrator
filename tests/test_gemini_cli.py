@@ -37,26 +37,27 @@ class TestGeminiCliAdapter(unittest.TestCase):
         self.chats_dir = self.gemini_home / "tmp" / self.project_id / "chats"
         self.chats_dir.mkdir(parents=True)
         
-        # Create a mock JSONL session file
+        # Create a mock JSON session file (monolithic)
         self.session_id = "test-session-uuid"
-        self.metadata = {
+        self.session_data = {
             "sessionId": self.session_id,
             "projectHash": _get_project_hash(self.project_root),
             "startTime": "2026-04-11T10:00:00Z",
             "lastUpdated": "2026-04-11T10:05:00Z",
             "summary": "Test Conversation",
-            "kind": "main"
+            "kind": "main",
+            "messages": [
+                {
+                    "id": "msg1",
+                    "timestamp": "2026-04-11T10:00:00Z",
+                    "type": "user",
+                    "content": [{"text": "Hello Gemini"}]
+                }
+            ]
         }
-        self.msg1 = {
-            "id": "msg1",
-            "timestamp": "2026-04-11T10:00:00Z",
-            "type": "user",
-            "content": [{"text": "Hello Gemini"}]
-        }
-        self.session_file = self.chats_dir / f"session-2026-04-11T10-00-{self.session_id[:8]}.jsonl"
+        self.session_file = self.chats_dir / f"session-2026-04-11T10-00-{self.session_id[:8]}.json"
         with open(self.session_file, "w", encoding="utf-8") as f:
-            f.write(json.dumps(self.metadata) + "\n")
-            f.write(json.dumps(self.msg1) + "\n")
+            json.dump(self.session_data, f)
 
     def tearDown(self):
         shutil.rmtree(self.test_dir)
@@ -90,12 +91,14 @@ class TestGeminiCliAdapter(unittest.TestCase):
         
         filename = adapter.write_conversation(new_conv, self.project_sub)
         self.assertTrue((self.chats_dir / filename).exists())
+        self.assertTrue(filename.endswith(".json"))
         
-        # Verify metadata includes kind: main and correct projectHash
+        # Verify JSON content
         with open(self.chats_dir / filename, "r", encoding="utf-8") as f:
-            meta = json.loads(f.readline())
-            self.assertEqual(meta["kind"], "main")
-            self.assertEqual(meta["projectHash"], _get_project_hash(self.project_root))
+            data = json.load(f)
+            self.assertEqual(data["kind"], "main")
+            self.assertEqual(data["projectHash"], _get_project_hash(self.project_root))
+            self.assertEqual(data["messages"][0]["content"][0]["text"], "Migrated Text")
 
 if __name__ == "__main__":
     unittest.main()
