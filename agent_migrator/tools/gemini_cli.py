@@ -261,28 +261,33 @@ class GeminiCliAdapter(ToolAdapter):
                 result_val: Any = turn.result
                 res_display: Any = turn.result
                 kind = "other"
-                disp_name = raw_name
                 desc = ""
 
                 # Robust mapping for Claude Code / Cursor / Gemini tool names
                 norm_name = raw_name.lower()
                 if norm_name in ("run_shell_command", "bash"):
                     name = "run_shell_command"
-                    disp_name = "Shell"
                     kind = "execute"
                     cmd = args.get("command", "")
+                    # Match native description pattern strictly for Gemini 0.37.1 UI
                     desc = f"{cmd} [current working directory {project_root}]"
                     res_display = turn.result
                 elif norm_name in ("replace", "edit", "write", "write_file"):
                     name = "replace"
                     kind = "edit"
-                    disp_name = "Edit"
                     file_path = args.get("file_path", "unknown")
                     desc = file_path
                     diff_text = turn.result
-                    if norm_name in ("write", "write_file") and not diff_text.startswith("---"):
+                    
+                    # Gemini CLI 0.37.1 DiffRenderer requires strict unified diff format starting with @@
+                    if not diff_text.startswith("---") and not diff_text.startswith("@@"):
+                        # Synthesize a 'new file' diff for write operations or simple success messages
                         lines = diff_text.splitlines()
                         diff_text = f"--- /dev/null\n+++ {file_path}\n@@ -0,0 +1,{len(lines)} @@\n" + "\n".join(f"+{l}" for l in lines)
+                    elif diff_text.startswith("---") and "@@" in diff_text:
+                        # Ensure it's not a fragmented diff that DiffRenderer might skip
+                        pass
+                    
                     res_display = {
                         "fileDiff": diff_text, "fileName": Path(file_path).name,
                         "filePath": str(project_root / file_path),
@@ -290,13 +295,11 @@ class GeminiCliAdapter(ToolAdapter):
                     }
                 elif norm_name in ("read_file", "read"):
                     name = "read_file"
-                    disp_name = "ReadFile"
                     kind = "read"
                     desc = args.get("file_path", "unknown")
                     res_display = turn.result
                 elif norm_name in ("invoke_agent", "agent", "codebase_investigator", "generalist"):
                     name = "invoke_agent"
-                    disp_name = "Agent"
                     kind = "agent"
                     desc = args.get("objective", args.get("request", args.get("prompt", "")))
                     res_display = {
@@ -306,12 +309,10 @@ class GeminiCliAdapter(ToolAdapter):
                     }
                 elif norm_name in ("enter_plan_mode", "enterplanmode", "enterplanmodetool"):
                     name = "enter_plan_mode"
-                    disp_name = "Enter Plan Mode"
                     kind = "plan"
                     desc = args.get("reason", "")
                 elif norm_name in ("exit_plan_mode", "exitplanmode", "exitplanmodetool"):
                     name = "exit_plan_mode"
-                    disp_name = "Exit Plan Mode"
                     kind = "plan"
                     desc = args.get("plan_filename", args.get("plan", ""))
                 else:
@@ -321,8 +322,6 @@ class GeminiCliAdapter(ToolAdapter):
                 tool_call = {
                     "id": call_id,
                     "name": name,
-                    "displayName": disp_name,
-                    "description": desc,
                     "args": args,
                     "result": [{
                         "functionResponse": {
@@ -335,6 +334,7 @@ class GeminiCliAdapter(ToolAdapter):
                     "status": "success",
                     "timestamp": ts_iso,
                     "kind": kind,
+                    "description": desc,
                     "renderOutputAsMarkdown": (kind != "execute")
                 }
                 current_turn_tools.append((tool_call, ts_iso))
