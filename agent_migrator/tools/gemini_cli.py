@@ -251,24 +251,93 @@ class GeminiCliAdapter(ToolAdapter):
         now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
         messages = []
+        # Group consecutive tool calls into one gemini message
+        current_turn_tools = []
+        
+        def flush_tools():
+            if not current_turn_tools:
+                return
+            ts_iso = current_turn_tools[0][1]
+            msg_id = str(uuid.uuid4())
+            messages.append({
+                "id": msg_id, "timestamp": ts_iso, "type": "gemini", "content": [],
+                "toolCalls": [t[0] for t in current_turn_tools]
+            })
+            current_turn_tools.clear()
+
         for turn in conv.turns:
             ts_iso = turn.timestamp.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z" if turn.timestamp else now_iso
             msg_id = str(uuid.uuid4())
+
             if isinstance(turn, TextMessage):
+                flush_tools()
                 messages.append({
                     "id": msg_id, "timestamp": ts_iso,
                     "type": "user" if turn.role == "user" else "gemini",
                     "content": [{"text": turn.text}]
                 })
             elif isinstance(turn, ToolCallMessage):
-                messages.append({
-                    "id": msg_id, "timestamp": ts_iso, "type": "gemini", "content": [],
-                    "toolCalls": [{
-                        "id": f"tc-{uuid.uuid4().hex[:8]}", "name": turn.name,
-                        "args": turn.input, "result": [{"text": turn.result}],
-                        "status": "success", "timestamp": ts_iso
-                    }]
-                })
+                # Map specialized tools for Gemini CLI 0.37.1 UI
+                name = turn.name
+                args = turn.input
+                result_display: Any = turn.result
+                kind = "other"
+
+                if name == "run_shell_command":
+                    name = "run_shell_command"
+                    kind = "execute"
+                    result_display = [{"text": turn.result}]
+                elif name in ("replace", "write_file"):
+                    kind = "edit"
+                    file_path = args.get("file_path", "unknown")
+                    file_name = Path(file_path).name
+                    diff_text = turn.result
+                    if name == "write_file" and not diff_text.startswith("---"):
+                        lines = diff_text.splitlines()
+                        diff_text = f"--- /dev/null\n+++ {file_path}\n@@ -0,0 +1,{len(lines)} @@\n" + "\n".join(f"+{l}" for l in lines)
+                    
+                    name = "edit"
+                    result_display = {
+                        "fileDiff": diff_text,
+                        "fileName": file_name,
+                        "filePath": str(project_root / file_path),
+                        "originalContent": "",
+                        "newContent": ""
+                    }
+                elif name in ("codebase_investigator", "generalist"):
+                    name = "agent"
+                    kind = "agent"
+                    result_display = {
+                        "isSubagentProgress": True,
+                        "agentName": "Subagent",
+                        "recentActivity": [{
+                            "id": str(uuid.uuid4()),
+                            "type": "thought",
+                            "content": turn.result,
+                            "status": "completed"
+                        }],
+                        "state": "completed",
+                        "result": turn.result
+                    }
+                elif name == "EnterPlanMode":
+                    name = "enter_plan_mode"
+                    kind = "plan"
+                elif name == "ExitPlanMode":
+                    name = "exit_plan_mode"
+                    kind = "plan"
+
+                tool_call = {
+                    "id": f"tc-{uuid.uuid4().hex[:8]}",
+                    "name": name,
+                    "args": args,
+                    "result": result_display,
+                    "status": "success",
+                    "timestamp": ts_iso,
+                    "kind": kind
+                }
+                current_turn_tools.append((tool_call, ts_iso))
+        
+        flush_tools()
 
         record = {
             "sessionId": session_id,

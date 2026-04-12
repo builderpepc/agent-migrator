@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
-from agent_migrator.models import Conversation, ConversationInfo, TextMessage
+from agent_migrator.models import Conversation, ConversationInfo, TextMessage, ToolCallMessage
 from agent_migrator.tools.gemini_cli import GeminiCliAdapter, _get_project_hash, _normalize_path
 
 
@@ -99,6 +99,40 @@ class TestGeminiCliAdapter(unittest.TestCase):
             self.assertEqual(data["kind"], "main")
             self.assertEqual(data["projectHash"], _get_project_hash(self.project_root))
             self.assertEqual(data["messages"][0]["content"][0]["text"], "Migrated Text")
+
+    def test_write_conversation_maps_tools(self):
+        """Should map CC tools to Gemini CLI specialized structures."""
+        adapter = GeminiCliAdapter()
+        info = ConversationInfo(
+            id="tool-test", name="Tool Test",
+            updated_at=datetime.now(timezone.utc),
+            created_at=datetime.now(timezone.utc),
+            message_count=1, size_bytes=0, source_tool="claude_code"
+        )
+        new_conv = Conversation(
+            info=info,
+            turns=[
+                ToolCallMessage(name="run_shell_command", input={"command": "ls"}, result="file1\nfile2"),
+                ToolCallMessage(name="replace", input={"file_path": "main.py"}, result="--- diff ---")
+            ]
+        )
+        
+        filename = adapter.write_conversation(new_conv, self.project_sub)
+        with open(self.chats_dir / filename, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            tools = data["messages"][0]["toolCalls"]
+            
+            # Shell tool mapping
+            self.assertEqual(tools[0]["name"], "run_shell_command")
+            self.assertEqual(tools[0]["kind"], "execute")
+            self.assertIsInstance(tools[0]["result"], list)
+            self.assertEqual(tools[0]["result"][0]["text"], "file1\nfile2")
+            
+            # Edit tool mapping
+            self.assertEqual(tools[1]["name"], "edit")
+            self.assertEqual(tools[1]["kind"], "edit")
+            self.assertIsInstance(tools[1]["result"], dict)
+            self.assertEqual(tools[1]["result"]["fileDiff"], "--- diff ---")
 
 if __name__ == "__main__":
     unittest.main()
