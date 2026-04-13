@@ -720,7 +720,7 @@ def _build_cursor_plan_id(name: str) -> str:
 def _extract_todos_from_markdown(md: str) -> list[dict]:
     """
     Extract structured todos from a CC plan (pure markdown).
-    Priority: checkboxes → H2 headings → top-level numbered items → single catch-all.
+    Priority: checkboxes → numbered list items → H2 headings → single catch-all.
     Returns [{id, content, status}].
     """
     # 1. Checkbox items: - [x] done  /  - [ ] pending
@@ -734,20 +734,20 @@ def _extract_todos_from_markdown(md: str) -> list[dict]:
     if todos:
         return todos
 
-    # 2. Level-2 headings (major plan phases, skip the H1 title)
-    heading_re = re.compile(r"^##\s+(?:\d+[.)]\s+)?(.+)$", re.MULTILINE)
-    for i, m in enumerate(heading_re.finditer(md), 1):
-        content = m.group(1).strip()
+    # 2. Top-level numbered list items (preferred over headings as they are actual tasks)
+    numbered_re = re.compile(r"^(\d+)[.)]\s+\*{0,2}(.+?)\*{0,2}$", re.MULTILINE)
+    for m in numbered_re.finditer(md):
+        i = int(m.group(1))
+        content = m.group(2).strip().rstrip(":")
         slug_id = re.sub(r"[^a-z0-9]+", "-", content.lower())[:40].strip("-") or str(i)
         todos.append({"id": f"{i}-{slug_id}", "content": content, "status": "pending"})
     if todos:
         return todos
 
-    # 3. Top-level numbered list items (only lines not preceded by indentation)
-    numbered_re = re.compile(r"^(\d+)[.)]\s+\*{0,2}(.+?)\*{0,2}$", re.MULTILINE)
-    for m in numbered_re.finditer(md):
-        i = int(m.group(1))
-        content = m.group(2).strip().rstrip(":")
+    # 3. Level-2 headings (major plan phases, skip the H1 title)
+    heading_re = re.compile(r"^##\s+(?:\d+[.)]\s+)?(.+)$", re.MULTILINE)
+    for i, m in enumerate(heading_re.finditer(md), 1):
+        content = m.group(1).strip()
         slug_id = re.sub(r"[^a-z0-9]+", "-", content.lower())[:40].strip("-") or str(i)
         todos.append({"id": f"{i}-{slug_id}", "content": content, "status": "pending"})
     if todos:

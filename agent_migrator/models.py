@@ -114,10 +114,17 @@ def inject_exit_plan_mode(
     ):
         return turns
 
+    # Build the result string in native CC format so CC renders the plan
+    # in historical sessions (renderToolResultMessage reads from this string).
+    epm_result = (
+        "User has approved your plan. You can now start coding."
+        " Start with updating your todo list if applicable"
+        f"\n\n## Approved Plan:\n{plan_content}"
+    )
     epm: "MessageTurn" = ToolCallMessage(
         name=StandardToolName.EXIT_PLAN_MODE,
         input={"plan": plan_content},
-        result="User has approved your plan. You can now start coding.",
+        result=epm_result,
     )
 
     # Find the assistant turn that presented the proposed plan.
