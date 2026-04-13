@@ -6,6 +6,17 @@ from pathlib import Path
 from agent_migrator.models import Conversation, ConversationInfo
 
 
+class ToolNetworkError(Exception):
+    """
+    Raised by write_conversation() when a network operation fails and a local
+    fallback may be available.
+
+    Adapters that support both a remote upload path and a local fallback should
+    raise this (or a subclass) for network/auth failures so that cli.py can
+    offer the fallback without knowing the adapter type.
+    """
+
+
 class ToolAdapter(ABC):
     """
     Abstract base class for an AI coding tool's conversation storage.
@@ -41,13 +52,23 @@ class ToolAdapter(ABC):
 
     @abstractmethod
     def write_conversation(
-        self, conv: Conversation, project_path: Path, **kwargs
+        self,
+        conv: Conversation,
+        project_path: Path,
+        *,
+        use_local_backend: bool = False,
     ) -> str:
         """
         Persist *conv* as a new conversation for *project_path*.
 
+        use_local_backend: if True, skip any remote/server upload path and write
+        directly to local storage. Adapters that have no remote path silently
+        ignore this flag. Defaults to False.
+
         Implementations must write atomically: use a temp file / SQLite
-        transaction so that an exception leaves no partial state.
+        transaction so that an exception leaves no partial state. Raises
+        ToolNetworkError (or a subclass) if a remote upload fails and a local
+        fallback is available.
 
         Returns the new conversation ID assigned by this tool.
         """

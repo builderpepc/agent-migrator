@@ -136,17 +136,16 @@ def main() -> None:
                 results.succeeded.append((conv_info, new_id))
                 console.print(" [green]done[/green]")
             except Exception as e:
-                # Check if this is a server upload failure that can fall back.
-                from agent_migrator.tools.cursor import ServerUploadError
-                if isinstance(e, ServerUploadError) and not use_local_fallback_decided:
+                # Check if this is a network upload failure that can fall back to local.
+                from agent_migrator.tools.base import ToolNetworkError
+                if isinstance(e, ToolNetworkError) and not use_local_fallback_decided:
                     use_local_fallback_decided = True
                     console.print(f" [yellow]server upload failed[/yellow]")
                     console.print(
-                        f"\n  [yellow]Could not upload conversation history to Cursor's server:[/yellow]"
+                        f"\n  [yellow]Could not upload conversation history to the destination's server:[/yellow]"
                         f"\n  {e}"
-                        f"\n\n  The fallback uses Cursor's local agent backend, which provides full"
-                        f"\n  conversation context but restricts model selection to Anthropic models"
-                        f"\n  (Sonnet/Opus) for migrated conversations.\n"
+                        f"\n\n  The fallback uses the destination's local backend, which provides full"
+                        f"\n  conversation context but may restrict model selection for migrated conversations.\n"
                     )
                     fallback = questionary.confirm(
                         "Use local fallback backend for this and remaining conversations?",
@@ -167,7 +166,7 @@ def main() -> None:
                             continue
                     else:
                         results.failed.append((conv_info, str(e)))
-                elif isinstance(e, ServerUploadError) and use_local_fallback:
+                elif isinstance(e, ToolNetworkError) and use_local_fallback:
                     # Already decided to use fallback — retry silently.
                     try:
                         conv = src.read_conversation(conv_info.id, project_path)

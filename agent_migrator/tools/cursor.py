@@ -18,9 +18,10 @@ from agent_migrator.models import (
     TextMessage,
     ToolCallMessage,
 )
-from agent_migrator.tools.base import ToolAdapter
+from agent_migrator.tools.base import ToolAdapter, ToolNetworkError
 
-class ServerUploadError(RuntimeError):
+
+class ServerUploadError(ToolNetworkError):
     """Raised when the ConvertOALToNAL server call fails (auth, network, etc.)."""
 
 
@@ -30,8 +31,8 @@ _TYPE_ASSISTANT = 2
 _CAPABILITY_TOOL = 15
 _CAPABILITY_SKIP = {22, 30}  # internal/streaming placeholders
 
-# Reverse map: Cursor tool names → Claude Code tool names.
-_CURSOR_TO_CC_TOOL_MAP: dict[str, str] = {
+# Map Cursor tool names → standard interchange tool names.
+_CURSOR_TO_STANDARD_TOOL_MAP: dict[str, str] = {
     "read_file":               "Read",
     "read_file_v2":            "Read",
     "edit_file":               "Edit",
@@ -77,7 +78,7 @@ def _adapt_cursor_tool(tfd: dict, bubble: dict) -> tuple[str, dict, str]:
     except Exception:
         result_obj = {}
 
-    cc_name = _CURSOR_TO_CC_TOOL_MAP.get(name, name)
+    cc_name = _CURSOR_TO_STANDARD_TOOL_MAP.get(name, name)
 
     if cc_name == "Read":
         # rawArgs: {"path": "..."} — maps to CC file_path
@@ -159,9 +160,9 @@ def _adapt_cursor_tool(tfd: dict, bubble: dict) -> tuple[str, dict, str]:
     return cc_name, cc_input, cc_result
 
 
-# Map Claude Code tool names to Cursor equivalents (name, numeric tool ID).
+# Map standard interchange tool names → Cursor equivalents (name, numeric tool ID).
 # Cursor's UI only renders tool bubbles for known numeric IDs; tool=0 is invisible.
-_CC_TOOL_MAP: dict[str, tuple[str, int]] = {
+_STANDARD_TO_CURSOR_TOOL_MAP: dict[str, tuple[str, int]] = {
     "Read":         ("read_file_v2",       40),
     "Edit":         ("search_replace",     38),
     "Write":        ("write",              38),
@@ -540,7 +541,7 @@ def _adapt_cc_tool(
     if name.startswith("mcp_"):
         return name, 19, json.dumps(inp), raw_result, [], {}
 
-    cursor_name, tool_num = _CC_TOOL_MAP.get(name, (name, 0))
+    cursor_name, tool_num = _STANDARD_TO_CURSOR_TOOL_MAP.get(name, (name, 0))
     code_blocks: list = []
 
     # Build Cursor-format params, result, and codeBlocks based on tool type.
