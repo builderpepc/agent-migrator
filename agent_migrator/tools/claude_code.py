@@ -557,11 +557,32 @@ class ClaudeCodeAdapter(ToolAdapter):
                     return f"msg_{uuid.uuid4().hex[:20]}"
 
                 def _tool_use_result(tc: "ToolCallMessage") -> dict | None:
-                    """Build a toolUseResult metadata block for display-enhancing tools."""
+                    """Build a toolUseResult metadata block for display-enhancing tools.
+
+                    CC's UserToolSuccessMessage runs toolUseResult through the tool's
+                    outputSchema (Zod safeParse).  If parsing fails, the component
+                    returns null and the tool result is invisible.  Every field that
+                    the schema marks as required MUST be present here.
+                    """
                     if tc.name == "Bash":
-                        # CC 2.1+ uses toolUseResult.stdout to render Bash output;
-                        # without it the result block appears empty in the TUI.
-                        return {"stdout": tc.result or ""}
+                        # BashTool output schema: {stdout, stderr, interrupted,
+                        # isImage, noOutputExpected, ...} — all required/with defaults.
+                        # Omitting any causes safeParse to fail → invisible result.
+                        return {
+                            "stdout": tc.result or "",
+                            "stderr": "",
+                            "interrupted": False,
+                            "isImage": False,
+                            "noOutputExpected": False,
+                        }
+                    if tc.name == "ExitPlanMode":
+                        # ExitPlanModeTool output schema: {plan (string|null, required),
+                        # isAgent (boolean, required), filePath?, ...}.
+                        # Without toolUseResult, safeParse(null) fails → invisible plan.
+                        return {
+                            "plan": tc.input.get("plan") or "",
+                            "isAgent": False,
+                        }
                     if tc.name == "Write":
                         return {
                             "type": "create",
