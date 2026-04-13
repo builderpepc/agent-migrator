@@ -53,6 +53,12 @@ _CODEX_SYSTEM_CONTENT_RE = re.compile(
 # Proposed-plan block
 _PROPOSED_PLAN_RE = re.compile(r"<proposed_plan>(.*?)</proposed_plan>", re.DOTALL)
 
+# Codex Bash Mode: user-initiated shell commands stored in user messages
+_USER_SHELL_CMD_RE = re.compile(
+    r"<user_shell_command>\s*<command>(.*?)</command>\s*<result>(.*?)</result>\s*</user_shell_command>",
+    re.DOTALL,
+)
+
 
 # ---------------------------------------------------------------------------
 # Tool name maps
@@ -349,11 +355,28 @@ class CodexAdapter(ToolAdapter):
                         content_blocks = []
 
                     if role == "user":
-                        # Collect input_text blocks; skip if all are system-injected
+                        # Collect input_text blocks; skip if all are system-injected.
+                        # Each block may be a Bash Mode <user_shell_command> — if so,
+                        # convert it to a ToolCallMessage(Bash) instead of user text.
                         texts: list[str] = []
                         for block in content_blocks:
                             text = block.get("text", "").strip() if isinstance(block, dict) else ""
-                            if text and not _CODEX_SYSTEM_CONTENT_RE.match(text):
+                            if not text:
+                                continue
+                            if _CODEX_SYSTEM_CONTENT_RE.match(text):
+                                continue
+                            # Bash Mode: the entire text is a <user_shell_command> block.
+                            m = _USER_SHELL_CMD_RE.fullmatch(text)
+                            if m:
+                                cmd = m.group(1).strip()
+                                result = m.group(2).strip()
+                                turns.append(ToolCallMessage(
+                                    name=StandardToolName.BASH,
+                                    input={"command": cmd},
+                                    result=result,
+                                    timestamp=ts,
+                                ))
+                            else:
                                 texts.append(text)
                         if texts:
                             turns.append(TextMessage(
@@ -509,14 +532,10 @@ class CodexAdapter(ToolAdapter):
         final_path = target_dir / filename
         tmp_path = target_dir / f"{filename}.tmp"
 
-        # Derive model_provider from conv.model
+        # Codex's session picker filters by model_provider and only shows sessions
+        # that match the configured provider (always "openai" on a standard
+        # install).  Migrated sessions must use "openai" to appear in /resume.
         model_provider = "openai"
-        if conv.model:
-            m = conv.model.lower()
-            if "claude" in m or "anthropic" in m:
-                model_provider = "anthropic"
-            elif "gemini" in m or "google" in m:
-                model_provider = "google"
 
         def _make_record(rtype: str, payload: dict) -> str:
             rec = {

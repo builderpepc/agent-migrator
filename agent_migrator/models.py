@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Literal, Union
@@ -70,6 +71,51 @@ class Conversation:
     # Claude Code: stored as ~/.claude/plans/{slug}.md
     # Other tools: write to and read from their equivalent plan storage.
     model: str | None = None          # API model ID used (e.g. "claude-sonnet-4-6")
+
+
+_PROPOSED_PLAN_RE = re.compile(r'<proposed_plan>', re.IGNORECASE)
+
+
+def inject_exit_plan_mode(
+    turns: list["MessageTurn"],
+    plan_content: str,
+) -> list["MessageTurn"]:
+    """
+    Ensure an ExitPlanMode ToolCallMessage appears in the turns when a plan
+    is present.  If one already exists, the list is returned unchanged.
+    Otherwise the new turn is inserted immediately after the first assistant
+    TextMessage that contains a <proposed_plan> tag (or appended at the end
+    if no such message is found).
+
+    This is called by write_conversation() in each adapter so that the
+    destination tool renders a plan panel rather than plain assistant text.
+    """
+    # Already has an ExitPlanMode — nothing to do.
+    if any(
+        isinstance(t, ToolCallMessage) and t.name == StandardToolName.EXIT_PLAN_MODE
+        for t in turns
+    ):
+        return turns
+
+    epm: "MessageTurn" = ToolCallMessage(
+        name=StandardToolName.EXIT_PLAN_MODE,
+        input={"plan": plan_content},
+        result="User has approved your plan. You can now start coding.",
+    )
+
+    # Find the assistant turn that presented the proposed plan.
+    for i, turn in enumerate(turns):
+        if (
+            isinstance(turn, TextMessage)
+            and turn.role == "assistant"
+            and _PROPOSED_PLAN_RE.search(turn.text)
+        ):
+            result = list(turns)
+            result.insert(i + 1, epm)
+            return result
+
+    # Fallback: no <proposed_plan> marker found — append at end.
+    return list(turns) + [epm]
 
 
 @dataclass

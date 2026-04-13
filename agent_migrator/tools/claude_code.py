@@ -14,6 +14,7 @@ from agent_migrator.models import (
     ConversationInfo,
     TextMessage,
     ToolCallMessage,
+    inject_exit_plan_mode,
 )
 from agent_migrator.tools.base import ToolAdapter
 
@@ -556,7 +557,11 @@ class ClaudeCodeAdapter(ToolAdapter):
                     return f"msg_{uuid.uuid4().hex[:20]}"
 
                 def _tool_use_result(tc: "ToolCallMessage") -> dict | None:
-                    """Build a toolUseResult metadata block for file-writing tools."""
+                    """Build a toolUseResult metadata block for display-enhancing tools."""
+                    if tc.name == "Bash":
+                        # CC 2.1+ uses toolUseResult.stdout to render Bash output;
+                        # without it the result block appears empty in the TUI.
+                        return {"stdout": tc.result or ""}
                     if tc.name == "Write":
                         return {
                             "type": "create",
@@ -624,7 +629,11 @@ class ClaudeCodeAdapter(ToolAdapter):
                         f.write(json.dumps(result_record) + "\n")
                         prev_uuid = result_uuid
 
-                turns = conv.turns
+                turns = (
+                    inject_exit_plan_mode(conv.turns, conv.plan_content)
+                    if conv.plan_content
+                    else conv.turns
+                )
                 i = 0
                 while i < len(turns):
                     turn = turns[i]

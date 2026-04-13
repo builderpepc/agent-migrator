@@ -17,6 +17,7 @@ from agent_migrator.models import (
     ConversationInfo,
     TextMessage,
     ToolCallMessage,
+    inject_exit_plan_mode,
 )
 from agent_migrator.tools.base import ToolAdapter, ToolNetworkError
 
@@ -1398,7 +1399,12 @@ class CursorAdapter(ToolAdapter):
                 last_checkpoint_id = ""
                 first_todo_bubble_id = ""
                 plan_todos: list = []
-                is_agentic = any(isinstance(t, ToolCallMessage) for t in conv.turns)
+                turns_to_write = (
+                    inject_exit_plan_mode(conv.turns, conv.plan_content)
+                    if conv.plan_content
+                    else conv.turns
+                )
+                is_agentic = any(isinstance(t, ToolCallMessage) for t in turns_to_write)
                 # Collect every bubble dict so we can populate conversationMap.
                 # Cursor's getLoadedConversation() looks up each bubbleId from
                 # fullConversationHeadersOnly in conversationMap — if a bubbleId is
@@ -1408,7 +1414,7 @@ class CursorAdapter(ToolAdapter):
                 # the map ourselves so Cursor sees the full history immediately.
                 conversation_map: dict = {}
 
-                for turn in conv.turns:
+                for turn in turns_to_write:
                     bubble_id = str(uuid.uuid4())
                     last_bubble_id = bubble_id
                     ts_iso = (
