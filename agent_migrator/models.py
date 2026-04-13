@@ -74,6 +74,19 @@ class Conversation:
 
 
 _PROPOSED_PLAN_RE = re.compile(r'<proposed_plan>', re.IGNORECASE)
+_PROPOSED_PLAN_BLOCK_RE = re.compile(
+    r'\s*<proposed_plan>.*?</proposed_plan>\s*', re.DOTALL | re.IGNORECASE
+)
+
+
+def _strip_proposed_plan_tag(text: str) -> str:
+    """Remove <proposed_plan>...</proposed_plan> blocks from assistant text.
+
+    Used when writing to tools that represent plans via a dedicated tool call
+    (ExitPlanMode) rather than inline XML — leaving the raw tags would show
+    as literal text in those tools' UIs.
+    """
+    return _PROPOSED_PLAN_BLOCK_RE.sub("\n", text).strip()
 
 
 def inject_exit_plan_mode(
@@ -86,6 +99,10 @@ def inject_exit_plan_mode(
     Otherwise the new turn is inserted immediately after the first assistant
     TextMessage that contains a <proposed_plan> tag (or appended at the end
     if no such message is found).
+
+    Any <proposed_plan>...</proposed_plan> block is stripped from the
+    assistant text that precedes the injected ExitPlanMode, since the plan
+    content is already carried by ExitPlanMode.input.plan.
 
     This is called by write_conversation() in each adapter so that the
     destination tool renders a plan panel rather than plain assistant text.
@@ -111,6 +128,13 @@ def inject_exit_plan_mode(
             and _PROPOSED_PLAN_RE.search(turn.text)
         ):
             result = list(turns)
+            # Replace the matching turn with a version that has the XML stripped.
+            stripped_text = _strip_proposed_plan_tag(turn.text)
+            result[i] = TextMessage(
+                role=turn.role,
+                text=stripped_text,
+                timestamp=turn.timestamp,
+            )
             result.insert(i + 1, epm)
             return result
 
