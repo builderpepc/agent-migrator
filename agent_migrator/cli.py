@@ -40,9 +40,10 @@ def main() -> None:
         sys.exit(1)
 
     from agent_migrator.tools.claude_code import ClaudeCodeAdapter
+    from agent_migrator.tools.codex import CodexAdapter
     from agent_migrator.tools.cursor import CursorAdapter
 
-    all_adapters = [CursorAdapter(), ClaudeCodeAdapter()]
+    all_adapters = [CursorAdapter(), ClaudeCodeAdapter(), CodexAdapter()]
     available = [a for a in all_adapters if a.is_available()]
 
     if len(available) < 2:

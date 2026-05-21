@@ -14,11 +14,25 @@ from agent_migrator.models import (
     ConversationInfo,
     TextMessage,
     ToolCallMessage,
+    inject_exit_plan_mode,
 )
 from agent_migrator.tools.base import ToolAdapter
 
 # Record types to skip when reading conversations
 _SKIP_TYPES = {"file-history-snapshot", "progress", "system"}
+
+# CC-internal tool names that have no portable meaning outside Claude Code.
+# These are dropped during read_conversation() so they never reach destination
+# adapters.  ExitPlanMode is handled separately via plan_content extraction.
+_CC_INTERNAL_TOOLS = {
+    "ToolSearch",
+    "EnterPlanMode",
+    "ExitPlanMode",
+    "ExitPlanModeV2",
+    "exit-plan-mode-v2",
+    "ListMcpResourcesTool",
+    "ReadMcpResourceTool",
+}
 
 
 def _claude_dir() -> Path:
@@ -56,7 +70,14 @@ def _parse_timestamp(ts: str | None) -> datetime | None:
 
 
 def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    dt = datetime.now(timezone.utc)
+    return dt.strftime('%Y-%m-%dT%H:%M:%S.') + f'{dt.microsecond // 1000:03d}Z'
+
+
+def _ts_iso(dt: datetime) -> str:
+    """Format a datetime as a CC-compatible ISO timestamp (ms precision, Z suffix)."""
+    dt_utc = dt.astimezone(timezone.utc)
+    return dt_utc.strftime('%Y-%m-%dT%H:%M:%S.') + f'{dt_utc.microsecond // 1000:03d}Z'
 
 
 _TAIL_READ_BYTES = 32768  # 32 KB — enough to find appended title fields
@@ -336,6 +357,9 @@ class ClaudeCodeAdapter(ToolAdapter):
 
         name = _display_name_from_file(jsonl_file) or conv_id
         turns: list = []
+        # Plan text stashed when ExitPlanMode is encountered during the main loop.
+        # Used as a fallback when no plan file exists on disk.
+        _epm_plan: str | None = None
 
         # Map tool_use_id -> ToolCallMessage (pending result)
         pending_tool_calls: dict[str, ToolCallMessage] = {}
@@ -381,8 +405,33 @@ class ClaudeCodeAdapter(ToolAdapter):
                                         timestamp=_parse_timestamp(rec.get("timestamp")),
                                     ))
                             elif btype == "tool_use":
+                                tool_name = block.get("name", "unknown")
+                                # ExitPlanMode: extract plan before filtering, then synthesize
+                                # a portable <proposed_plan> TextMessage so destination adapters
+                                # (Codex, etc.) can render the plan natively at its correct
+                                # position in the conversation.
+                                if tool_name in (
+                                    "ExitPlanMode", "ExitPlanModeV2", "exit-plan-mode-v2"
+                                ):
+                                    plan_txt = block.get("input", {}).get("plan", "").strip()
+                                    if plan_txt:
+                                        if _epm_plan is None:
+                                            _epm_plan = plan_txt
+                                        turns.append(TextMessage(
+                                            role="assistant",
+                                            text=f"<proposed_plan>\n{plan_txt}\n</proposed_plan>",
+                                            timestamp=_parse_timestamp(rec.get("timestamp")),
+                                        ))
+                                # Drop CC-internal tools (plan-mode markers, ToolSearch,
+                                # MCP plugin tools) — they have no portable meaning and
+                                # must not appear verbatim in destination adapters.
+                                if (
+                                    tool_name in _CC_INTERNAL_TOOLS
+                                    or tool_name.startswith("mcp__")
+                                ):
+                                    continue
                                 tc = ToolCallMessage(
-                                    name=block.get("name", "unknown"),
+                                    name=tool_name,
                                     input=block.get("input", {}),
                                     result="",
                                     timestamp=_parse_timestamp(rec.get("timestamp")),
@@ -476,7 +525,7 @@ class ClaudeCodeAdapter(ToolAdapter):
         )
 
         # Read associated plan: check the plan file first (most up-to-date),
-        # then fall back to the ExitPlanMode tool_use embedded in the transcript.
+        # then fall back to the plan text stashed from ExitPlanMode during the loop.
         plan_content: str | None = None
         slug = _extract_json_string_field(jsonl_file.read_text(encoding="utf-8", errors="replace"), "slug")
         if slug:
@@ -484,14 +533,7 @@ class ClaudeCodeAdapter(ToolAdapter):
             if plan_file.exists():
                 plan_content = plan_file.read_text(encoding="utf-8").strip() or None
         if plan_content is None:
-            for turn in turns:
-                if (
-                    isinstance(turn, ToolCallMessage)
-                    and turn.name in ("ExitPlanMode", "ExitPlanModeV2", "exit-plan-mode-v2")
-                    and turn.input.get("plan")
-                ):
-                    plan_content = turn.input["plan"].strip() or None
-                    break
+            plan_content = _epm_plan
 
         # Extract the API model ID from the first assistant record.
         model: str | None = None
@@ -531,6 +573,13 @@ class ClaudeCodeAdapter(ToolAdapter):
 
         try:
             with open(tmp_path, "w", encoding="utf-8") as f:
+                # Leading permission-mode record (required by CC 2.1.x+)
+                f.write(json.dumps({
+                    "type": "permission-mode",
+                    "permissionMode": "default",
+                    "sessionId": session_id,
+                }) + "\n")
+
                 prev_uuid: str | None = None
 
                 def _make_base(rec_type: str, rec_uuid: str, ts: str) -> dict:
@@ -544,6 +593,9 @@ class ClaudeCodeAdapter(ToolAdapter):
                         "userType": "external",
                         "cwd": str(project_path),
                         "slug": slug,
+                        "version": "2.1.145",
+                        "entrypoint": "cli",
+                        "gitBranch": "HEAD",
                     }
 
                 def _msg_id() -> str:
@@ -556,7 +608,60 @@ class ClaudeCodeAdapter(ToolAdapter):
                     return f"msg_{uuid.uuid4().hex[:20]}"
 
                 def _tool_use_result(tc: "ToolCallMessage") -> dict | None:
-                    """Build a toolUseResult metadata block for file-writing tools."""
+                    """Build a toolUseResult metadata block for display-enhancing tools.
+
+                    CC's UserToolSuccessMessage runs toolUseResult through the tool's
+                    outputSchema (Zod safeParse).  If parsing fails, the component
+                    returns null and the tool result is invisible.  Every field that
+                    the schema marks as required MUST be present here.
+                    """
+                    if tc.name == "Bash":
+                        # BashTool output schema: {stdout, stderr, interrupted,
+                        # isImage, noOutputExpected, ...} — all required/with defaults.
+                        # Omitting any causes safeParse to fail → invisible result.
+                        return {
+                            "stdout": tc.result or "",
+                            "stderr": "",
+                            "interrupted": False,
+                            "isImage": False,
+                            "noOutputExpected": False,
+                        }
+                    if tc.name == "ExitPlanMode":
+                        # ExitPlanModeTool output schema: {plan (string|null, required),
+                        # isAgent (boolean, required), filePath?, ...}.
+                        # Without toolUseResult, safeParse(null) fails → invisible plan.
+                        return {
+                            "plan": tc.input.get("plan") or "",
+                            "isAgent": False,
+                        }
+                    if tc.name == "Glob":
+                        result = tc.result
+                        try:
+                            result_obj = json.loads(result) if isinstance(result, str) else (result or {})
+                        except Exception:
+                            result_obj = {}
+                        filenames = (
+                            result_obj.get("filenames")
+                            or result_obj.get("files")
+                            or []
+                        )
+                        if not isinstance(filenames, list):
+                            filenames = []
+                        return {
+                            "filenames": filenames,
+                            "durationMs": 0,
+                            "numFiles": len(filenames),
+                            "truncated": False,
+                        }
+                    if tc.name == "Read":
+                        content = tc.result if isinstance(tc.result, str) else ""
+                        return {
+                            "type": "text",
+                            "file": {
+                                "filePath": tc.input.get("file_path", ""),
+                                "content": content,
+                            },
+                        }
                     if tc.name == "Write":
                         return {
                             "type": "create",
@@ -582,14 +687,18 @@ class ClaudeCodeAdapter(ToolAdapter):
                 def _write_tool_batch(
                     tool_batch: list[tuple[str, "ToolCallMessage"]],
                     ts: str,
+                    shared_msg_id: str | None = None,
                 ) -> None:
                     nonlocal prev_uuid
                     # One assistant record with all tool_use blocks
                     asst_uuid = str(uuid.uuid4())
                     asst_record = _make_base("assistant", asst_uuid, ts)
+                    asst_record["requestId"] = f"req_{uuid.uuid4().hex[:24]}"
                     asst_record["message"] = {
-                        "id": _msg_id(),
+                        "id": shared_msg_id or _msg_id(),
+                        "type": "message",
                         "role": "assistant",
+                        "model": conv.model or "claude-sonnet-4-6",
                         "content": [
                             {
                                 "type": "tool_use",
@@ -599,6 +708,11 @@ class ClaudeCodeAdapter(ToolAdapter):
                             }
                             for tool_use_id, tc in tool_batch
                         ],
+                        "stop_reason": "tool_use",
+                        "stop_sequence": None,
+                        "stop_details": None,
+                        "usage": {"input_tokens": 0, "output_tokens": 0, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0},
+                        "diagnostics": None,
                     }
                     f.write(json.dumps(asst_record) + "\n")
                     prev_uuid = asst_uuid
@@ -607,6 +721,8 @@ class ClaudeCodeAdapter(ToolAdapter):
                     for tool_use_id, tc in tool_batch:
                         result_uuid = str(uuid.uuid4())
                         result_record = _make_base("user", result_uuid, ts)
+                        result_record["promptId"] = str(uuid.uuid4())
+                        result_record["permissionMode"] = "default"
                         result_record["message"] = {
                             "role": "user",
                             "content": [
@@ -624,68 +740,75 @@ class ClaudeCodeAdapter(ToolAdapter):
                         f.write(json.dumps(result_record) + "\n")
                         prev_uuid = result_uuid
 
-                turns = conv.turns
+                turns = (
+                    inject_exit_plan_mode(conv.turns, conv.plan_content)
+                    if conv.plan_content
+                    else conv.turns
+                )
                 i = 0
                 while i < len(turns):
                     turn = turns[i]
-                    ts = turn.timestamp.isoformat() if turn.timestamp else _now_iso()
+                    ts = _ts_iso(turn.timestamp) if turn.timestamp else _now_iso()
 
                     if isinstance(turn, TextMessage) and turn.role == "user":
                         rec_uuid = str(uuid.uuid4())
                         record = _make_base("user", rec_uuid, ts)
+                        record["promptId"] = str(uuid.uuid4())
+                        record["permissionMode"] = "default"
                         record["message"] = {"role": "user", "content": turn.text}
                         f.write(json.dumps(record) + "\n")
                         prev_uuid = rec_uuid
                         i += 1
 
                     elif isinstance(turn, TextMessage) and turn.role == "assistant":
-                        # Collect any tool calls that immediately follow this text block —
-                        # they belong in the same assistant message per the Claude API contract.
-                        content_blocks: list[dict] = [{"type": "text", "text": turn.text}]
-                        tool_batch: list[tuple[str, ToolCallMessage]] = []
+                        # Collect any tool calls that immediately follow this text block.
                         i += 1
+                        tool_calls_following: list[ToolCallMessage] = []
                         while i < len(turns) and isinstance(turns[i], ToolCallMessage):
-                            tc = turns[i]
-                            tool_use_id = f"toolu_{uuid.uuid4().hex[:24]}"
-                            content_blocks.append({
-                                "type": "tool_use",
-                                "id": tool_use_id,
-                                "name": tc.name,
-                                "input": tc.input,
-                            })
-                            tool_batch.append((tool_use_id, tc))
+                            tool_calls_following.append(turns[i])
                             i += 1
+
+                        # The API rejects empty text content blocks. Skip the text
+                        # record entirely when the text is blank.
+                        if not turn.text.strip():
+                            if tool_calls_following:
+                                tool_batch = [
+                                    (f"toolu_{uuid.uuid4().hex[:24]}", tc)
+                                    for tc in tool_calls_following
+                                ]
+                                _write_tool_batch(tool_batch, ts)
+                            # No text and no tool calls — skip this turn entirely.
+                            continue
+
+                        # Native CC splits text and tool_use into separate records but
+                        # gives them the same message.id — that shared id is what tells
+                        # the renderer they belong to the same logical assistant turn.
+                        turn_msg_id = _msg_id()
 
                         asst_uuid = str(uuid.uuid4())
                         asst_record = _make_base("assistant", asst_uuid, ts)
+                        asst_record["requestId"] = f"req_{uuid.uuid4().hex[:24]}"
                         asst_record["message"] = {
-                            "id": _msg_id(),
+                            "id": turn_msg_id,
+                            "type": "message",
                             "role": "assistant",
-                            "content": content_blocks,
+                            "model": conv.model or "claude-sonnet-4-6",
+                            "content": [{"type": "text", "text": turn.text}],
+                            "stop_reason": "tool_use" if tool_calls_following else "end_turn",
+                            "stop_sequence": None,
+                            "stop_details": None,
+                            "usage": {"input_tokens": 0, "output_tokens": 0, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0},
+                            "diagnostics": None,
                         }
                         f.write(json.dumps(asst_record) + "\n")
                         prev_uuid = asst_uuid
 
-                        if tool_batch:
-                            for tuid, tc in tool_batch:
-                                result_uuid = str(uuid.uuid4())
-                                result_record = _make_base("user", result_uuid, ts)
-                                result_record["message"] = {
-                                    "role": "user",
-                                    "content": [
-                                        {
-                                            "type": "tool_result",
-                                            "tool_use_id": tuid,
-                                            "content": tc.result,
-                                        }
-                                    ],
-                                }
-                                result_record["sourceToolAssistantUUID"] = asst_uuid
-                                tur = _tool_use_result(tc)
-                                if tur is not None:
-                                    result_record["toolUseResult"] = tur
-                                f.write(json.dumps(result_record) + "\n")
-                                prev_uuid = result_uuid
+                        if tool_calls_following:
+                            tool_batch = [
+                                (f"toolu_{uuid.uuid4().hex[:24]}", tc)
+                                for tc in tool_calls_following
+                            ]
+                            _write_tool_batch(tool_batch, ts, shared_msg_id=turn_msg_id)
 
                     else:
                         # ToolCallMessage not preceded by assistant text — collect the

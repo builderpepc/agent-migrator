@@ -17,6 +17,7 @@ from agent_migrator.models import (
     ConversationInfo,
     TextMessage,
     ToolCallMessage,
+    inject_exit_plan_mode,
 )
 from agent_migrator.tools.base import ToolAdapter, ToolNetworkError
 
@@ -30,6 +31,19 @@ _TYPE_USER = 1
 _TYPE_ASSISTANT = 2
 _CAPABILITY_TOOL = 15
 _CAPABILITY_SKIP = {22, 30}  # internal/streaming placeholders
+
+# Cursor-internal tools that have no portable meaning outside Cursor's UI.
+# These are filtered during read_conversation() rather than passed through
+# as unknown tool calls.
+_CURSOR_INTERNAL_TOOLS: set[str] = {
+    "ask_question",       # Cursor UI dialog — no CC equivalent
+    "create_plan",        # Cursor plan creation — plan content captured separately
+    "todo_write",         # Cursor todo management — handled via plan
+    "todo_read",          # Cursor todo reading
+    "read_lints",         # Cursor lint reading
+    "await",              # Cursor async wait primitive
+    "delete_file",        # Cursor file deletion — no standard CC equivalent
+}
 
 # Map Cursor tool names → standard interchange tool names.
 _CURSOR_TO_STANDARD_TOOL_MAP: dict[str, str] = {
@@ -54,11 +68,18 @@ _CURSOR_TO_STANDARD_TOOL_MAP: dict[str, str] = {
 }
 
 
-def _adapt_cursor_tool(tfd: dict, bubble: dict) -> tuple[str, dict, str]:
+def _adapt_cursor_tool(
+    tfd: dict,
+    bubble: dict,
+    con: "sqlite3.Connection | None" = None,
+) -> tuple[str, dict, str]:
     """
     Map a Cursor toolFormerData record to a CC-compatible (name, input, result).
     rawArgs carries the model's original arguments; params has the processed form.
     Falls back to params for tools where rawArgs is empty (e.g. edit_file_v2).
+
+    con is the read-only global DB connection, used to resolve composer.content.*
+    blobs for edit_file_v2 tools that store file content by content ID.
     """
     name = tfd.get("name", "unknown")
     raw_args_str = tfd.get("rawArgs", "")
@@ -96,16 +117,31 @@ def _adapt_cursor_tool(tfd: dict, bubble: dict) -> tuple[str, dict, str]:
             }
             cc_result = "Applied edit."
         else:
-            # edit_file_v2: rawArgs is always empty. Cursor stores the new file
-            # content in params.streamingContent (falling back to codeBlocks).
-            # Since we only have the final content (no old_string), map to Write
-            # so the full file content is visible in CC history.
+            # edit_file_v2: rawArgs is always empty. In Cursor's NAL format the
+            # new file content is stored as a composer.content.* blob referenced
+            # by afterContentId in the result JSON. Fall back to streamingContent
+            # (older sessions) and then to codeBlocks if neither is present.
             file_path = raw.get("file_path") or params.get("relativeWorkspacePath", "")
-            code_blocks = bubble.get("codeBlocks", [])
-            new_content = (
-                params.get("streamingContent", "")
-                or (code_blocks[0].get("content", "") if code_blocks else "")
-            )
+            new_content = ""
+            # Primary: resolve afterContentId from the result JSON
+            try:
+                result_obj2 = json.loads(result_str) if result_str else {}
+                after_id = result_obj2.get("afterContentId", "")
+                if after_id and con is not None:
+                    crow = con.execute(
+                        "SELECT value FROM cursorDiskKV WHERE key = ?", (after_id,)
+                    ).fetchone()
+                    if crow and crow[0]:
+                        new_content = crow[0]
+            except Exception:
+                pass
+            # Fallback: streamingContent or codeBlocks (older Cursor sessions)
+            if not new_content:
+                code_blocks = bubble.get("codeBlocks", [])
+                new_content = (
+                    params.get("streamingContent", "")
+                    or (code_blocks[0].get("content", "") if code_blocks else "")
+                )
             cc_name = "Write"
             cc_input = {"file_path": file_path, "content": new_content}
             cc_result = "File written successfully."
@@ -125,7 +161,8 @@ def _adapt_cursor_tool(tfd: dict, bubble: dict) -> tuple[str, dict, str]:
             files = result_obj.get("files") or result_obj.get("directoryTreeRoot", "")
             cc_result = json.dumps(files) if not isinstance(files, str) else files
         else:
-            cc_input = {"command": raw.get("command", "")}
+            # run_terminal_command_v2 stores command in params, not rawArgs
+            cc_input = {"command": raw.get("command", "") or params.get("command", "")}
             cc_result = result_obj.get("output", result_str)
 
     elif cc_name == "Grep":
@@ -699,11 +736,95 @@ def _cursor_plans_dir() -> Path:
 
 _CURSOR_PLAN_FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n", re.DOTALL)
 
+_PROPOSED_PLAN_BLOCK_RE = re.compile(
+    r'\s*<proposed_plan>(.*?)</proposed_plan>\s*', re.DOTALL | re.IGNORECASE
+)
+
 
 def _strip_cursor_plan_frontmatter(content: str) -> str:
     """Return just the markdown body of a Cursor .plan.md (strip YAML frontmatter)."""
     m = _CURSOR_PLAN_FRONTMATTER_RE.match(content)
     return content[m.end():].strip() if m else content.strip()
+
+
+def _cursor_prepare_turns(
+    turns: list,
+    plan_content: str | None,
+) -> list:
+    """
+    Prepare turns for writing to Cursor.
+
+    Cursor does not have a native ExitPlanMode equivalent, so plans are
+    surfaced as a written Markdown file (Write tool call creating PLAN.md).
+    This shows as a "created file" bubble in Cursor UI.
+
+    1. Converts ExitPlanMode ToolCallMessages to Write ToolCallMessages that
+       create PLAN.md — the "written markdown file" approach.
+    2. Strips <proposed_plan>...</proposed_plan> XML from assistant text —
+       removes the XML wrapper but keeps the surrounding text intact.
+    3. If plan_content is set and no ExitPlanMode was found, appends a Write
+       ToolCallMessage creating PLAN.md at the end.
+    """
+    result = []
+    plan_found = False
+
+    for turn in turns:
+        if isinstance(turn, ToolCallMessage) and turn.name in (
+            "ExitPlanMode", "ExitPlanModeV2", "exit-plan-mode-v2"
+        ):
+            # Convert ExitPlanMode to a Write tool call creating PLAN.md.
+            plan_text = turn.input.get("plan", "") or (plan_content or "")
+            if plan_text:
+                result.append(ToolCallMessage(
+                    name="Write",
+                    input={"file_path": "PLAN.md", "content": plan_text.strip()},
+                    result="File written successfully.",
+                    timestamp=turn.timestamp,
+                ))
+                plan_found = True
+            continue
+
+        if (
+            isinstance(turn, TextMessage)
+            and turn.role == "assistant"
+            and _PROPOSED_PLAN_BLOCK_RE.search(turn.text)
+        ):
+            # Remove the XML wrapper tags; keep the surrounding text and inner content.
+            new_text = re.sub(
+                r'<proposed_plan>(.*?)</proposed_plan>',
+                lambda m: m.group(1).strip(),
+                turn.text,
+                flags=re.DOTALL | re.IGNORECASE,
+            ).strip()
+            result.append(TextMessage(
+                role=turn.role,
+                text=new_text,
+                timestamp=turn.timestamp,
+            ))
+            # Also emit a Write("PLAN.md") so the plan is visible as a file-write
+            # bubble in Cursor's conversation view (same as the ExitPlanMode path).
+            plan_text = plan_content or new_text
+            if plan_text:
+                result.append(ToolCallMessage(
+                    name="Write",
+                    input={"file_path": "PLAN.md", "content": plan_text.strip()},
+                    result="File written successfully.",
+                    timestamp=turn.timestamp,
+                ))
+                plan_found = True
+            continue
+
+        result.append(turn)
+
+    # If plan_content is set but was not yet surfaced, append a Write PLAN.md.
+    if plan_content and not plan_found:
+        result.append(ToolCallMessage(
+            name="Write",
+            input={"file_path": "PLAN.md", "content": plan_content.strip()},
+            result="File written successfully.",
+        ))
+
+    return result
 
 
 def _build_cursor_plan_id(name: str) -> str:
@@ -719,7 +840,7 @@ def _build_cursor_plan_id(name: str) -> str:
 def _extract_todos_from_markdown(md: str) -> list[dict]:
     """
     Extract structured todos from a CC plan (pure markdown).
-    Priority: checkboxes → H2 headings → top-level numbered items → single catch-all.
+    Priority: checkboxes → numbered list items → H2 headings → single catch-all.
     Returns [{id, content, status}].
     """
     # 1. Checkbox items: - [x] done  /  - [ ] pending
@@ -733,20 +854,20 @@ def _extract_todos_from_markdown(md: str) -> list[dict]:
     if todos:
         return todos
 
-    # 2. Level-2 headings (major plan phases, skip the H1 title)
-    heading_re = re.compile(r"^##\s+(?:\d+[.)]\s+)?(.+)$", re.MULTILINE)
-    for i, m in enumerate(heading_re.finditer(md), 1):
-        content = m.group(1).strip()
+    # 2. Top-level numbered list items (preferred over headings as they are actual tasks)
+    numbered_re = re.compile(r"^(\d+)[.)]\s+\*{0,2}(.+?)\*{0,2}$", re.MULTILINE)
+    for m in numbered_re.finditer(md):
+        i = int(m.group(1))
+        content = m.group(2).strip().rstrip(":")
         slug_id = re.sub(r"[^a-z0-9]+", "-", content.lower())[:40].strip("-") or str(i)
         todos.append({"id": f"{i}-{slug_id}", "content": content, "status": "pending"})
     if todos:
         return todos
 
-    # 3. Top-level numbered list items (only lines not preceded by indentation)
-    numbered_re = re.compile(r"^(\d+)[.)]\s+\*{0,2}(.+?)\*{0,2}$", re.MULTILINE)
-    for m in numbered_re.finditer(md):
-        i = int(m.group(1))
-        content = m.group(2).strip().rstrip(":")
+    # 3. Level-2 headings (major plan phases, skip the H1 title)
+    heading_re = re.compile(r"^##\s+(?:\d+[.)]\s+)?(.+)$", re.MULTILINE)
+    for i, m in enumerate(heading_re.finditer(md), 1):
+        content = m.group(1).strip()
         slug_id = re.sub(r"[^a-z0-9]+", "-", content.lower())[:40].strip("-") or str(i)
         todos.append({"id": f"{i}-{slug_id}", "content": content, "status": "pending"})
     if todos:
@@ -1171,7 +1292,35 @@ class CursorAdapter(ToolAdapter):
         updated_ms = data.get("lastUpdatedAt") or data.get("createdAt") or _now_ms()
         created_ms = data.get("createdAt") or updated_ms
 
+        # Read plan_content before the bubble loop so it can be injected inline
+        # at the create_plan position (mirroring CC reader's ExitPlanMode synthesis).
+        plan_content: str | None = None
+        try:
+            grow = con.execute(
+                "SELECT value FROM ItemTable WHERE key = 'composer.planRegistry'"
+            ).fetchone()
+            if grow and grow[0]:
+                registry = json.loads(grow[0])
+                matching: list[tuple[int, Path]] = []
+                for plan_meta in registry.values():
+                    if conv_id in plan_meta.get("referencedBy", []) or \
+                            conv_id == plan_meta.get("createdBy"):
+                        uri = plan_meta.get("uri", {})
+                        plan_path = Path(uri.get("fsPath", ""))
+                        if plan_path.exists():
+                            ts = plan_meta.get("lastUpdatedAt", 0)
+                            matching.append((ts, plan_path))
+                if matching:
+                    matching.sort(key=lambda x: x[0], reverse=True)
+                    _, plan_path = matching[0]
+                    plan_content = _strip_cursor_plan_frontmatter(
+                        plan_path.read_text(encoding="utf-8")
+                    ) or None
+        except Exception:
+            pass
+
         turns = []
+        _plan_injected = False
         for item in bubble_items:
             bid = item.get("bubbleId")
             if not bid:
@@ -1199,7 +1348,24 @@ class CursorAdapter(ToolAdapter):
                     continue
                 elif capability == _CAPABILITY_TOOL:
                     tfd = bubble.get("toolFormerData") or {}
-                    tool_name, input_dict, result = _adapt_cursor_tool(tfd, bubble)
+                    native_name = tfd.get("name", "")
+                    # Filter Cursor-internal tools and MCP tools that have no
+                    # portable meaning in the neutral interchange format.
+                    if (
+                        native_name in _CURSOR_INTERNAL_TOOLS
+                        or native_name.startswith("mcp-")
+                    ):
+                        # At the create_plan position, inject a <proposed_plan>
+                        # TextMessage so inject_exit_plan_mode() places ExitPlanMode
+                        # inline (same technique as CC reader's ExitPlanMode synthesis).
+                        if native_name == "create_plan" and plan_content and not _plan_injected:
+                            turns.append(TextMessage(
+                                role="assistant",
+                                text=f"<proposed_plan>\n{plan_content}\n</proposed_plan>",
+                            ))
+                            _plan_injected = True
+                        continue
+                    tool_name, input_dict, result = _adapt_cursor_tool(tfd, bubble, con)
                     turns.append(ToolCallMessage(
                         name=tool_name,
                         input=input_dict,
@@ -1209,39 +1375,6 @@ class CursorAdapter(ToolAdapter):
                     # Regular assistant text bubble
                     if text:
                         turns.append(TextMessage(role="assistant", text=text))
-
-        con.close()
-
-        # Read any plan associated with this conversation via planRegistry.
-        plan_content: str | None = None
-        global_db = _global_db_path()
-        if global_db.exists():
-            try:
-                gcon = sqlite3.connect(f"file:{global_db}?mode=ro", uri=True)
-                grow = gcon.execute(
-                    "SELECT value FROM ItemTable WHERE key = 'composer.planRegistry'"
-                ).fetchone()
-                gcon.close()
-                if grow and grow[0]:
-                    registry = json.loads(grow[0])
-                    # Collect all plans associated with this conversation, pick most recent.
-                    matching: list[tuple[int, Path]] = []
-                    for plan_meta in registry.values():
-                        if conv_id in plan_meta.get("referencedBy", []) or \
-                                conv_id == plan_meta.get("createdBy"):
-                            uri = plan_meta.get("uri", {})
-                            plan_path = Path(uri.get("fsPath", ""))
-                            if plan_path.exists():
-                                ts = plan_meta.get("lastUpdatedAt", 0)
-                                matching.append((ts, plan_path))
-                    if matching:
-                        matching.sort(key=lambda x: x[0], reverse=True)
-                        _, plan_path = matching[0]
-                        plan_content = _strip_cursor_plan_frontmatter(
-                            plan_path.read_text(encoding="utf-8")
-                        ) or None
-            except Exception:
-                pass
 
         info = ConversationInfo(
             id=conv_id,
@@ -1267,6 +1400,19 @@ class CursorAdapter(ToolAdapter):
                 f"No Cursor workspace found for {project_path}. "
                 "Open this directory in Cursor at least once first."
             )
+
+        # Two-stage turn preparation when a plan is present:
+        # 1. _cursor_prepare_turns: converts ExitPlanMode → Write("PLAN.md") and strips
+        #    <proposed_plan> XML, emitting a Write("PLAN.md") in both cases so the plan
+        #    appears as a "created file" bubble in the Cursor conversation view.
+        # 2. inject_exit_plan_mode: re-inserts ExitPlanMode (now at the end, since step 1
+        #    removed any pre-existing one) so _adapt_cc_tool can convert it to a
+        #    todo_write bubble for the sidebar todos.
+        if conv.plan_content:
+            turns = _cursor_prepare_turns(conv.turns, conv.plan_content)
+            turns = inject_exit_plan_mode(turns, conv.plan_content)
+        else:
+            turns = conv.turns
 
         global_db = _global_db_path()
         composer_id = str(uuid.uuid4())
@@ -1398,7 +1544,7 @@ class CursorAdapter(ToolAdapter):
                 last_checkpoint_id = ""
                 first_todo_bubble_id = ""
                 plan_todos: list = []
-                is_agentic = any(isinstance(t, ToolCallMessage) for t in conv.turns)
+                is_agentic = any(isinstance(t, ToolCallMessage) for t in turns)
                 # Collect every bubble dict so we can populate conversationMap.
                 # Cursor's getLoadedConversation() looks up each bubbleId from
                 # fullConversationHeadersOnly in conversationMap — if a bubbleId is
@@ -1408,7 +1554,7 @@ class CursorAdapter(ToolAdapter):
                 # the map ourselves so Cursor sees the full history immediately.
                 conversation_map: dict = {}
 
-                for turn in conv.turns:
+                for turn in turns:
                     bubble_id = str(uuid.uuid4())
                     last_bubble_id = bubble_id
                     ts_iso = (
@@ -1688,6 +1834,15 @@ class CursorAdapter(ToolAdapter):
         finally:
             con.close()
 
+        # Pre-compute plan_id so both workspace and global DB entries get the same value.
+        early_plan_id: str | None = None
+        if conv.plan_content:
+            _early_plan_name = conv.info.name or "Migrated Plan"
+            _h1 = re.search(r"^#\s+(.+)$", conv.plan_content, re.MULTILINE)
+            if _h1:
+                _early_plan_name = _h1.group(1).strip()
+            early_plan_id = _build_cursor_plan_id(_early_plan_name)
+
         # Register in the workspace's composer list.
         ws_db = ws_dir / "state.vscdb"
         ws_con = sqlite3.connect(str(ws_db), timeout=30)
@@ -1720,7 +1875,7 @@ class CursorAdapter(ToolAdapter):
                     "isProject": False,
                     "isBestOfNSubcomposer": False,
                     "numSubComposers": 0,
-                    "referencedPlans": [],
+                    "referencedPlans": [early_plan_id] if early_plan_id else [],
                     "totalLinesAdded": 0,
                     "totalLinesRemoved": 0,
                     "filesChangedCount": 0,
@@ -1745,6 +1900,7 @@ class CursorAdapter(ToolAdapter):
             ws_con.close()
 
         # Prepare plan data (file write + metadata) before opening any DB connection.
+        # Reuse early_plan_id so workspace and global DB entries share the same ID.
         plan_id: str | None = None
         plan_entry: dict | None = None
         if conv.plan_content:
@@ -1752,7 +1908,7 @@ class CursorAdapter(ToolAdapter):
             h1 = re.search(r"^#\s+(.+)$", conv.plan_content, re.MULTILINE)
             if h1:
                 plan_name = h1.group(1).strip()
-            plan_id = _build_cursor_plan_id(plan_name)
+            plan_id = early_plan_id  # already computed above
             plans_dir = _cursor_plans_dir()
             plans_dir.mkdir(parents=True, exist_ok=True)
             plan_file = plans_dir / f"{plan_id}.plan.md"
