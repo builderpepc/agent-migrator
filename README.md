@@ -65,7 +65,23 @@ All pairs support:
 
 ## How it works
 
-Conversations are read into a tool-agnostic normalized format (`TextMessage` and `ToolCallMessage` turns) and written out in the destination format. Each tool is implemented as a `ToolAdapter` subclass in `agent_migrator/tools/`.
+Conversations are read into a tool-agnostic normalized format (`TextMessage` and `ToolCallMessage` turns) and written out in the destination format. Each tool is implemented as a `ToolAdapter` subclass in `agent_migrator/tools/`. This decouples all source/destination pairs — adding a new tool requires only a new adapter; all existing migration paths continue to work unchanged.
+
+### Extensibility
+
+To add support for a new tool, implement the `ToolAdapter` interface in `agent_migrator/tools/` and register it in `cli.py`:
+
+```python
+class MyToolAdapter(ToolAdapter):
+    name = "My Tool"
+    tool_id = "mytool"
+
+    def is_available(self) -> bool: ...
+    def list_conversations(self, project_path: Path) -> list[ConversationInfo]: ...
+    def read_conversation(self, conv_id: str, project_path: Path) -> Conversation: ...
+    def write_conversation(self, conv: Conversation, project_path: Path, *, use_local_backend: bool = False) -> str: ...
+    def delete_conversation(self, conv_id: str, project_path: Path) -> None: ...
+```
 
 ### Storage locations
 
