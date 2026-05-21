@@ -78,12 +78,12 @@ Conversations are read into a tool-agnostic normalized format (`TextMessage` and
 
 ### Extensibility
 
-To add support for a new tool, implement the `ToolAdapter` interface in `agent_migrator/tools/` and register it in `cli.py`:
+To add support for a new coding agent, implement the `ToolAdapter` interface in `agent_migrator/tools/` and register it in `cli.py`:
 
 ```python
-class MyToolAdapter(ToolAdapter):
-    name = "My Tool"
-    tool_id = "mytool"
+class MyAgentAdapter(ToolAdapter):
+    name = "My Agent"
+    tool_id = "myagent"
 
     def is_available(self) -> bool: ...
     def list_conversations(self, project_path: Path) -> list[ConversationInfo]: ...
