@@ -418,11 +418,14 @@ class GeminiAdapter(AgentAdapter):
                     # enter_plan_mode
                     ep_id = str(uuid.uuid4())
                     ep_tc_id = f"enter_plan_mode_{uuid.uuid4().hex[:16]}_0"
+                    plan_reason = "Presenting migrated plan."
                     lines.append(json.dumps(_gemini_record(ep_id, turn_ts, [{
                         "id": ep_tc_id, "name": "enter_plan_mode",
-                        "args": {"reason": "Presenting migrated plan."},
+                        "args": {"reason": plan_reason},
                         "result": _tc_result("enter_plan_mode", ep_tc_id, "Entered plan mode."),
-                        "status": "success", "timestamp": turn_ts, "displayName": "EnterPlanMode",
+                        "status": "success", "timestamp": turn_ts,
+                        "displayName": "enter_plan_mode",
+                        "description": plan_reason,
                     }])))
 
                     # write_file (plan)
@@ -431,8 +434,10 @@ class GeminiAdapter(AgentAdapter):
                     lines.append(json.dumps(_gemini_record(wf_id, turn_ts, [{
                         "id": wf_tc_id, "name": "write_file",
                         "args": {"file_path": plan_fp, "content": plan_text},
-                        "result": _tc_result("write_file", wf_tc_id, f"Successfully wrote {plan_fn}."),
-                        "status": "success", "timestamp": turn_ts, "displayName": "WriteFile",
+                        "result": _tc_result("write_file", wf_tc_id, f"Successfully wrote {plan_fn}.\n\n{plan_text}"),
+                        "status": "success", "timestamp": turn_ts,
+                        "displayName": "WriteFile",
+                        "description": f"Writing to {plan_fn}",
                     }])))
 
                     # exit_plan_mode
@@ -441,46 +446,63 @@ class GeminiAdapter(AgentAdapter):
                         "id": xp_tc_id, "name": "exit_plan_mode",
                         "args": {"plan_filename": plan_fn},
                         "result": _tc_result("exit_plan_mode", xp_tc_id, "Exited plan mode."),
-                        "status": "success", "timestamp": turn_ts, "displayName": "ExitPlanMode",
+                        "status": "success", "timestamp": turn_ts,
+                        "displayName": "exit_plan_mode",
+                        "description": f"Requesting plan approval for: {plan_fp}",
                     }])))
 
                 else:
                     gemini_name = _STANDARD_TO_GEMINI.get(turn.name, turn.name)
 
                     if turn.name == StandardToolName.WRITE:
-                        tc_args: dict = {
-                            "file_path": turn.input.get("file_path", ""),
-                            "content": turn.input.get("content", ""),
-                        }
+                        fp = turn.input.get("file_path", "")
+                        content = turn.input.get("content", "")
+                        tc_args: dict = {"file_path": fp, "content": content}
+                        tc_display = "WriteFile"
+                        tc_desc = f"Writing to {fp}"
+                        tc_result_out = f"Successfully wrote to {fp}.\n\n{content}"
                     elif turn.name == StandardToolName.EDIT:
-                        tc_args = {
-                            "file_path": turn.input.get("file_path", ""),
-                            "old_string": turn.input.get("old_string", ""),
-                            "new_string": turn.input.get("new_string", ""),
-                            "allow_multiple": False,
-                        }
+                        fp = turn.input.get("file_path", "")
+                        old = turn.input.get("old_string", "")
+                        new = turn.input.get("new_string", "")
+                        tc_args = {"file_path": fp, "old_string": old, "new_string": new, "allow_multiple": False}
+                        tc_display = "Edit"
+                        tc_desc = fp
+                        tc_result_out = turn.result if isinstance(turn.result, str) else json.dumps(turn.result)
                     elif turn.name == StandardToolName.BASH:
-                        tc_args = {
-                            "command": turn.input.get("command", ""),
-                            "description": "",
-                        }
+                        cmd = turn.input.get("command", "")
+                        tc_args = {"command": cmd, "description": ""}
+                        tc_display = "Shell"
+                        tc_desc = cmd
+                        tc_result_out = turn.result if isinstance(turn.result, str) else json.dumps(turn.result)
                     elif turn.name == StandardToolName.READ:
-                        tc_args = {"file_path": turn.input.get("file_path", "")}
+                        fp = turn.input.get("file_path", "")
+                        tc_args = {"file_path": fp}
+                        tc_display = "ReadFile"
+                        tc_desc = fp
+                        tc_result_out = turn.result if isinstance(turn.result, str) else json.dumps(turn.result)
                     elif turn.name == StandardToolName.GLOB:
                         pattern = turn.input.get("pattern", ".")
-                        tc_args = {"dir_path": pattern.rstrip("/**")}
+                        dir_path = pattern.rstrip("/**")
+                        tc_args = {"dir_path": dir_path}
+                        tc_display = "ReadFolder"
+                        tc_desc = dir_path
+                        tc_result_out = turn.result if isinstance(turn.result, str) else json.dumps(turn.result)
                     else:
                         tc_args = turn.input or {}
+                        tc_display = gemini_name
+                        tc_desc = ""
+                        tc_result_out = turn.result if isinstance(turn.result, str) else json.dumps(turn.result)
 
-                    result_str = turn.result if isinstance(turn.result, str) else json.dumps(turn.result)
                     tc_id = f"{gemini_name}_{uuid.uuid4().hex[:16]}_0"
 
                     lines.append(json.dumps(_gemini_record(rec_id, turn_ts, [{
                         "id": tc_id, "name": gemini_name,
                         "args": tc_args,
-                        "result": _tc_result(gemini_name, tc_id, result_str),
+                        "result": _tc_result(gemini_name, tc_id, tc_result_out),
                         "status": "success", "timestamp": turn_ts,
-                        "displayName": turn.name,
+                        "displayName": tc_display,
+                        "description": tc_desc,
                     }])))
 
         jsonl_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
