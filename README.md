@@ -1,6 +1,15 @@
 # agent-migrator
 
-A CLI tool for migrating conversation history between AI coding tools. Supports bidirectional migration between **Cursor**, **Claude Code**, **Codex**, and **Gemini CLI**.
+A CLI tool for migrating conversation history between AI coding tools.
+
+## Supported Coding Agents
+
+- **Claude Code** (Anthropic)
+- **Codex** (OpenAI)
+- **Gemini CLI** (Google)
+- **Cursor**
+
+All pairs are supported bidirectionally.
 
 ---
 
