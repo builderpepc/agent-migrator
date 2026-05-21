@@ -480,6 +480,8 @@ class GeminiAdapter(AgentAdapter):
                         "status": "success", "timestamp": turn_ts,
                         "displayName": "enter_plan_mode",
                         "description": plan_reason,
+                        "resultDisplay": f"Switching to Plan mode: {plan_reason}",
+                        "renderOutputAsMarkdown": True,
                     }])))
 
                     # write_file (plan)
@@ -492,6 +494,8 @@ class GeminiAdapter(AgentAdapter):
                         "status": "success", "timestamp": turn_ts,
                         "displayName": "WriteFile",
                         "description": f"Writing to {plan_fn}",
+                        "resultDisplay": _write_result_display(plan_fp, plan_text),
+                        "renderOutputAsMarkdown": True,
                     }])))
 
                     # exit_plan_mode
@@ -503,11 +507,20 @@ class GeminiAdapter(AgentAdapter):
                         "status": "success", "timestamp": turn_ts,
                         "displayName": "exit_plan_mode",
                         "description": f"Requesting plan approval for: {plan_fp}",
+                        "resultDisplay": f"Plan approved: {plan_fp}",
+                        "renderOutputAsMarkdown": True,
                     }])))
 
                 else:
                     gemini_name = _STANDARD_TO_GEMINI.get(turn.name, turn.name)
                     tc_result_display: object = None
+
+                    # Skip CC plan-file writes (they map to the EXIT_PLAN_MODE path above).
+                    if turn.name == StandardToolName.WRITE and (
+                        "/.claude/plans/" in turn.input.get("file_path", "").replace("\\", "/")
+                        or "\\.claude\\plans\\" in turn.input.get("file_path", "")
+                    ):
+                        continue
 
                     if turn.name == StandardToolName.WRITE:
                         fp = turn.input.get("file_path", "")
