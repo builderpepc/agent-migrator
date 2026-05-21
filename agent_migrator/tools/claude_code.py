@@ -706,6 +706,18 @@ class ClaudeCodeAdapter(ToolAdapter):
                             tool_calls_following.append(turns[i])
                             i += 1
 
+                        # The API rejects empty text content blocks. Skip the text
+                        # record entirely when the text is blank.
+                        if not turn.text.strip():
+                            if tool_calls_following:
+                                tool_batch = [
+                                    (f"toolu_{uuid.uuid4().hex[:24]}", tc)
+                                    for tc in tool_calls_following
+                                ]
+                                _write_tool_batch(tool_batch, ts)
+                            # No text and no tool calls — skip this turn entirely.
+                            continue
+
                         # Native CC splits text and tool_use into separate records but
                         # gives them the same message.id — that shared id is what tells
                         # the renderer they belong to the same logical assistant turn.
