@@ -571,6 +571,13 @@ class CodexAdapter(ToolAdapter):
                         input_dict = json.loads(raw_args) if raw_args else {}
                     except Exception:
                         input_dict = {"raw": raw_args}
+                    # CC's Bash schema uses z.strictObject — strip Codex-specific
+                    # fields (workdir, timeout_ms) and map timeout_ms → timeout.
+                    if std_name == StandardToolName.BASH and isinstance(input_dict, dict):
+                        bash_input: dict = {"command": input_dict.get("command", "")}
+                        if "timeout_ms" in input_dict:
+                            bash_input["timeout"] = input_dict["timeout_ms"]
+                        input_dict = bash_input
                     call_id = payload.get("call_id", "")
                     tc = ToolCallMessage(
                         name=std_name,

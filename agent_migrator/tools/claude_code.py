@@ -625,6 +625,7 @@ class ClaudeCodeAdapter(ToolAdapter):
                 def _write_tool_batch(
                     tool_batch: list[tuple[str, "ToolCallMessage"]],
                     ts: str,
+                    shared_msg_id: str | None = None,
                 ) -> None:
                     nonlocal prev_uuid
                     # One assistant record with all tool_use blocks
@@ -632,7 +633,7 @@ class ClaudeCodeAdapter(ToolAdapter):
                     asst_record = _make_base("assistant", asst_uuid, ts)
                     asst_record["requestId"] = f"req_{uuid.uuid4().hex[:24]}"
                     asst_record["message"] = {
-                        "id": _msg_id(),
+                        "id": shared_msg_id or _msg_id(),
                         "type": "message",
                         "role": "assistant",
                         "model": conv.model or "claude-sonnet-4-6",
@@ -698,33 +699,28 @@ class ClaudeCodeAdapter(ToolAdapter):
                         i += 1
 
                     elif isinstance(turn, TextMessage) and turn.role == "assistant":
-                        # Collect any tool calls that immediately follow this text block —
-                        # they belong in the same assistant message per the Claude API contract.
-                        content_blocks: list[dict] = [{"type": "text", "text": turn.text}]
-                        tool_batch: list[tuple[str, ToolCallMessage]] = []
+                        # Collect any tool calls that immediately follow this text block.
                         i += 1
+                        tool_calls_following: list[ToolCallMessage] = []
                         while i < len(turns) and isinstance(turns[i], ToolCallMessage):
-                            tc = turns[i]
-                            tool_use_id = f"toolu_{uuid.uuid4().hex[:24]}"
-                            content_blocks.append({
-                                "type": "tool_use",
-                                "id": tool_use_id,
-                                "name": tc.name,
-                                "input": tc.input,
-                            })
-                            tool_batch.append((tool_use_id, tc))
+                            tool_calls_following.append(turns[i])
                             i += 1
+
+                        # Native CC splits text and tool_use into separate records but
+                        # gives them the same message.id — that shared id is what tells
+                        # the renderer they belong to the same logical assistant turn.
+                        turn_msg_id = _msg_id()
 
                         asst_uuid = str(uuid.uuid4())
                         asst_record = _make_base("assistant", asst_uuid, ts)
                         asst_record["requestId"] = f"req_{uuid.uuid4().hex[:24]}"
                         asst_record["message"] = {
-                            "id": _msg_id(),
+                            "id": turn_msg_id,
                             "type": "message",
                             "role": "assistant",
                             "model": conv.model or "claude-sonnet-4-6",
-                            "content": content_blocks,
-                            "stop_reason": "tool_use" if tool_batch else "end_turn",
+                            "content": [{"type": "text", "text": turn.text}],
+                            "stop_reason": "tool_use" if tool_calls_following else "end_turn",
                             "stop_sequence": None,
                             "stop_details": None,
                             "usage": {"input_tokens": 0, "output_tokens": 0, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0},
@@ -733,28 +729,12 @@ class ClaudeCodeAdapter(ToolAdapter):
                         f.write(json.dumps(asst_record) + "\n")
                         prev_uuid = asst_uuid
 
-                        if tool_batch:
-                            for tuid, tc in tool_batch:
-                                result_uuid = str(uuid.uuid4())
-                                result_record = _make_base("user", result_uuid, ts)
-                                result_record["promptId"] = str(uuid.uuid4())
-                                result_record["permissionMode"] = "default"
-                                result_record["message"] = {
-                                    "role": "user",
-                                    "content": [
-                                        {
-                                            "type": "tool_result",
-                                            "tool_use_id": tuid,
-                                            "content": tc.result,
-                                        }
-                                    ],
-                                }
-                                result_record["sourceToolAssistantUUID"] = asst_uuid
-                                tur = _tool_use_result(tc)
-                                if tur is not None:
-                                    result_record["toolUseResult"] = tur
-                                f.write(json.dumps(result_record) + "\n")
-                                prev_uuid = result_uuid
+                        if tool_calls_following:
+                            tool_batch = [
+                                (f"toolu_{uuid.uuid4().hex[:24]}", tc)
+                                for tc in tool_calls_following
+                            ]
+                            _write_tool_batch(tool_batch, ts, shared_msg_id=turn_msg_id)
 
                     else:
                         # ToolCallMessage not preceded by assistant text — collect the
