@@ -189,6 +189,93 @@ def _parse_apply_patch_changes(patch_input: str) -> dict:
     return changes
 
 
+def _read_apply_patch(patch_text: str) -> list[tuple]:
+    """
+    Parse an apply_patch payload from a Codex session into per-file operations
+    suitable for creating ToolCallMessages.
+
+    Returns a list of tuples:
+      ("add",    file_path, content)          -- Write tool call
+      ("update", file_path, old_str, new_str) -- Edit tool call (one per hunk)
+      ("delete", file_path)                   -- no tool call emitted
+    """
+    ops: list[tuple] = []
+    current_file: str | None = None
+    current_op: str | None = None
+    # For "add": accumulate content lines
+    add_lines: list[str] = []
+    # For "update": accumulate current hunk lines; completed hunks stored here
+    hunk_lines: list[str] = []
+    completed_hunks: list[tuple[str, str]] = []
+
+    def _flush_hunk() -> None:
+        if not hunk_lines:
+            return
+        old_parts: list[str] = []
+        new_parts: list[str] = []
+        for ln in hunk_lines:
+            if ln.startswith("-"):
+                old_parts.append(ln[1:])
+            elif ln.startswith("+"):
+                new_parts.append(ln[1:])
+            else:
+                # context line (space prefix or bare) — include in both
+                bare = ln[1:] if ln.startswith(" ") else ln
+                old_parts.append(bare)
+                new_parts.append(bare)
+        completed_hunks.append(("\n".join(old_parts), "\n".join(new_parts)))
+        hunk_lines.clear()
+
+    def _flush_file() -> None:
+        nonlocal current_file, current_op
+        if current_file is None or current_op is None:
+            return
+        if current_op == "add":
+            content = "\n".join(
+                ln[1:] if ln.startswith("+") else ln for ln in add_lines
+            )
+            ops.append(("add", current_file, content))
+            add_lines.clear()
+        elif current_op == "update":
+            _flush_hunk()
+            for old_str, new_str in completed_hunks:
+                ops.append(("update", current_file, old_str, new_str))
+            completed_hunks.clear()
+            hunk_lines.clear()
+        elif current_op == "delete":
+            ops.append(("delete", current_file))
+        current_file = None
+        current_op = None
+
+    for raw_line in patch_text.splitlines():
+        if raw_line in ("*** Begin Patch", "*** End Patch"):
+            if raw_line == "*** End Patch":
+                _flush_file()
+            continue
+        if raw_line.startswith("*** Add File: "):
+            _flush_file()
+            current_file = raw_line[len("*** Add File: "):]
+            current_op = "add"
+        elif raw_line.startswith("*** Update File: "):
+            _flush_file()
+            current_file = raw_line[len("*** Update File: "):]
+            current_op = "update"
+        elif raw_line.startswith("*** Delete File: "):
+            _flush_file()
+            current_file = raw_line[len("*** Delete File: "):]
+            current_op = "delete"
+        elif current_op == "add":
+            add_lines.append(raw_line)
+        elif current_op == "update":
+            if raw_line == "@@":
+                _flush_hunk()
+            else:
+                hunk_lines.append(raw_line)
+
+    _flush_file()
+    return ops
+
+
 # ---------------------------------------------------------------------------
 # File scanning helpers
 # ---------------------------------------------------------------------------
@@ -507,20 +594,52 @@ class CodexAdapter(ToolAdapter):
                 # ---- custom_tool_call (apply_patch etc.) -------------------
                 elif ptype == "custom_tool_call":
                     native_name = payload.get("name", "unknown")
-                    std_name = _CODEX_TO_STANDARD.get(native_name, native_name)
                     raw_input = payload.get("input", "")
-                    # Store raw patch string in input dict for round-trip fidelity
-                    input_dict = {"patch": raw_input} if isinstance(raw_input, str) else raw_input
                     call_id = payload.get("call_id", "")
-                    tc = ToolCallMessage(
-                        name=std_name,
-                        input=input_dict,
-                        result="",
-                        timestamp=ts,
-                    )
-                    turns.append(tc)
-                    if call_id:
-                        pending_tool_calls[call_id] = tc
+
+                    if native_name == "apply_patch" and isinstance(raw_input, str):
+                        # Expand multi-file patch into individual Write/Edit messages
+                        patch_messages: list[ToolCallMessage] = []
+                        for op in _read_apply_patch(raw_input):
+                            if op[0] == "add":
+                                _, file_path, content = op
+                                patch_messages.append(ToolCallMessage(
+                                    name=StandardToolName.WRITE,
+                                    input={"file_path": file_path, "content": content},
+                                    result="File written successfully.",
+                                    timestamp=ts,
+                                ))
+                            elif op[0] == "update":
+                                _, file_path, old_str, new_str = op
+                                patch_messages.append(ToolCallMessage(
+                                    name=StandardToolName.EDIT,
+                                    input={
+                                        "file_path": file_path,
+                                        "old_string": old_str,
+                                        "new_string": new_str,
+                                    },
+                                    result="File edited successfully.",
+                                    timestamp=ts,
+                                ))
+                            # "delete" — omitted; no CC equivalent to show
+                        turns.extend(patch_messages)
+                        # Register the last message for result matching
+                        if call_id and patch_messages:
+                            pending_tool_calls[call_id] = patch_messages[-1]
+                    else:
+                        std_name = _CODEX_TO_STANDARD.get(native_name, native_name)
+                        input_dict = (
+                            {"patch": raw_input} if isinstance(raw_input, str) else raw_input
+                        )
+                        tc = ToolCallMessage(
+                            name=std_name,
+                            input=input_dict,
+                            result="",
+                            timestamp=ts,
+                        )
+                        turns.append(tc)
+                        if call_id:
+                            pending_tool_calls[call_id] = tc
 
                 # ---- custom_tool_call_output --------------------------------
                 elif ptype == "custom_tool_call_output":
