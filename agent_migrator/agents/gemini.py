@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import difflib
 import hashlib
 import json
 import platform
@@ -372,6 +373,59 @@ class GeminiAdapter(AgentAdapter):
         def _tc_result(name: str, tc_id: str, output: str) -> list:
             return [{"functionResponse": {"id": tc_id, "name": name, "response": {"output": output}}}]
 
+        def _write_result_display(fp: str, content: str) -> dict:
+            basename = Path(fp).name
+            content_lines = content.splitlines(keepends=True)
+            n = len(content_lines)
+            diff_lines = [
+                f"Index: {basename}\n",
+                "===================================================================\n",
+                f"--- {basename}\tOriginal\n",
+                f"+++ {basename}\tWritten\n",
+                f"@@ -0,0 +1,{n} @@\n",
+            ] + [f"+{l}" if l.endswith("\n") else f"+{l}\n" for l in content_lines]
+            return {
+                "fileDiff": "".join(diff_lines),
+                "fileName": basename,
+                "filePath": fp,
+                "originalContent": "",
+                "newContent": content,
+                "diffStat": {
+                    "model_added_lines": n, "model_removed_lines": 0,
+                    "model_added_chars": len(content), "model_removed_chars": 0,
+                    "user_added_lines": 0, "user_removed_lines": 0,
+                    "user_added_chars": 0, "user_removed_chars": 0,
+                },
+                "isNewFile": True,
+            }
+
+        def _edit_result_display(fp: str, old: str, new: str) -> dict:
+            basename = Path(fp).name
+            old_lines = old.splitlines(keepends=True)
+            new_lines = new.splitlines(keepends=True)
+            diff = list(difflib.unified_diff(
+                old_lines, new_lines,
+                fromfile=f"{basename}\tCurrent",
+                tofile=f"{basename}\tProposed",
+            ))
+            diff_str = f"Index: {basename}\n===================================================================\n" + "".join(diff)
+            added = sum(1 for l in diff if l.startswith("+") and not l.startswith("+++"))
+            removed = sum(1 for l in diff if l.startswith("-") and not l.startswith("---"))
+            return {
+                "fileDiff": diff_str,
+                "fileName": basename,
+                "filePath": fp,
+                "originalContent": old,
+                "newContent": new,
+                "diffStat": {
+                    "model_added_lines": added, "model_removed_lines": removed,
+                    "model_added_chars": len(new), "model_removed_chars": len(old),
+                    "user_added_lines": 0, "user_removed_lines": 0,
+                    "user_added_chars": 0, "user_removed_chars": 0,
+                },
+                "isNewFile": False,
+            }
+
         lines: list[str] = []
         log_entries: list[dict] = []
         msg_idx = 0
@@ -453,6 +507,7 @@ class GeminiAdapter(AgentAdapter):
 
                 else:
                     gemini_name = _STANDARD_TO_GEMINI.get(turn.name, turn.name)
+                    tc_result_display: object = None
 
                     if turn.name == StandardToolName.WRITE:
                         fp = turn.input.get("file_path", "")
@@ -461,6 +516,7 @@ class GeminiAdapter(AgentAdapter):
                         tc_display = "WriteFile"
                         tc_desc = f"Writing to {fp}"
                         tc_result_out = f"Successfully wrote to {fp}.\n\n{content}"
+                        tc_result_display = _write_result_display(fp, content)
                     elif turn.name == StandardToolName.EDIT:
                         fp = turn.input.get("file_path", "")
                         old = turn.input.get("old_string", "")
@@ -469,12 +525,14 @@ class GeminiAdapter(AgentAdapter):
                         tc_display = "Edit"
                         tc_desc = fp
                         tc_result_out = turn.result if isinstance(turn.result, str) else json.dumps(turn.result)
+                        tc_result_display = _edit_result_display(fp, old, new)
                     elif turn.name == StandardToolName.BASH:
                         cmd = turn.input.get("command", "")
                         tc_args = {"command": cmd, "description": ""}
                         tc_display = "Shell"
                         tc_desc = cmd
                         tc_result_out = turn.result if isinstance(turn.result, str) else json.dumps(turn.result)
+                        tc_result_display = tc_result_out
                     elif turn.name == StandardToolName.READ:
                         fp = turn.input.get("file_path", "")
                         tc_args = {"file_path": fp}
@@ -495,15 +553,19 @@ class GeminiAdapter(AgentAdapter):
                         tc_result_out = turn.result if isinstance(turn.result, str) else json.dumps(turn.result)
 
                     tc_id = f"{gemini_name}_{uuid.uuid4().hex[:16]}_0"
-
-                    lines.append(json.dumps(_gemini_record(rec_id, turn_ts, [{
+                    tc_record: dict = {
                         "id": tc_id, "name": gemini_name,
                         "args": tc_args,
                         "result": _tc_result(gemini_name, tc_id, tc_result_out),
                         "status": "success", "timestamp": turn_ts,
                         "displayName": tc_display,
                         "description": tc_desc,
-                    }])))
+                        "renderOutputAsMarkdown": True,
+                    }
+                    if tc_result_display is not None:
+                        tc_record["resultDisplay"] = tc_result_display
+
+                    lines.append(json.dumps(_gemini_record(rec_id, turn_ts, [tc_record])))
 
         jsonl_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
