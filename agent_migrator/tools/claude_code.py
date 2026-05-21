@@ -357,6 +357,9 @@ class ClaudeCodeAdapter(ToolAdapter):
 
         name = _display_name_from_file(jsonl_file) or conv_id
         turns: list = []
+        # Plan text stashed when ExitPlanMode is encountered during the main loop.
+        # Used as a fallback when no plan file exists on disk.
+        _epm_plan: str | None = None
 
         # Map tool_use_id -> ToolCallMessage (pending result)
         pending_tool_calls: dict[str, ToolCallMessage] = {}
@@ -403,6 +406,22 @@ class ClaudeCodeAdapter(ToolAdapter):
                                     ))
                             elif btype == "tool_use":
                                 tool_name = block.get("name", "unknown")
+                                # ExitPlanMode: extract plan before filtering, then synthesize
+                                # a portable <proposed_plan> TextMessage so destination adapters
+                                # (Codex, etc.) can render the plan natively at its correct
+                                # position in the conversation.
+                                if tool_name in (
+                                    "ExitPlanMode", "ExitPlanModeV2", "exit-plan-mode-v2"
+                                ):
+                                    plan_txt = block.get("input", {}).get("plan", "").strip()
+                                    if plan_txt:
+                                        if _epm_plan is None:
+                                            _epm_plan = plan_txt
+                                        turns.append(TextMessage(
+                                            role="assistant",
+                                            text=f"<proposed_plan>\n{plan_txt}\n</proposed_plan>",
+                                            timestamp=_parse_timestamp(rec.get("timestamp")),
+                                        ))
                                 # Drop CC-internal tools (plan-mode markers, ToolSearch,
                                 # MCP plugin tools) — they have no portable meaning and
                                 # must not appear verbatim in destination adapters.
@@ -506,7 +525,7 @@ class ClaudeCodeAdapter(ToolAdapter):
         )
 
         # Read associated plan: check the plan file first (most up-to-date),
-        # then fall back to the ExitPlanMode tool_use embedded in the transcript.
+        # then fall back to the plan text stashed from ExitPlanMode during the loop.
         plan_content: str | None = None
         slug = _extract_json_string_field(jsonl_file.read_text(encoding="utf-8", errors="replace"), "slug")
         if slug:
@@ -514,14 +533,7 @@ class ClaudeCodeAdapter(ToolAdapter):
             if plan_file.exists():
                 plan_content = plan_file.read_text(encoding="utf-8").strip() or None
         if plan_content is None:
-            for turn in turns:
-                if (
-                    isinstance(turn, ToolCallMessage)
-                    and turn.name in ("ExitPlanMode", "ExitPlanModeV2", "exit-plan-mode-v2")
-                    and turn.input.get("plan")
-                ):
-                    plan_content = turn.input["plan"].strip() or None
-                    break
+            plan_content = _epm_plan
 
         # Extract the API model ID from the first assistant record.
         model: str | None = None
