@@ -6,7 +6,7 @@ from pathlib import Path
 from agent_migrator.models import Conversation, ConversationInfo
 
 
-class ToolNetworkError(Exception):
+class AgentNetworkError(Exception):
     """
     Raised by write_conversation() when a network operation fails and a local
     fallback may be available.
@@ -17,12 +17,12 @@ class ToolNetworkError(Exception):
     """
 
 
-class ToolAdapter(ABC):
+class AgentAdapter(ABC):
     """
     Abstract base class for an AI coding tool's conversation storage.
 
     To add support for a new tool:
-    1. Subclass ToolAdapter and implement all abstract methods.
+    1. Subclass AgentAdapter and implement all abstract methods.
     2. Add an instance of the subclass to the adapter list in cli.py.
     """
 
@@ -67,7 +67,7 @@ class ToolAdapter(ABC):
 
         Implementations must write atomically: use a temp file / SQLite
         transaction so that an exception leaves no partial state. Raises
-        ToolNetworkError (or a subclass) if a remote upload fails and a local
+        AgentNetworkError (or a subclass) if a remote upload fails and a local
         fallback is available.
 
         Returns the new conversation ID assigned by this tool.

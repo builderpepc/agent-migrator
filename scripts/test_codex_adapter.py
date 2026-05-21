@@ -14,8 +14,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from agent_migrator.models import StandardToolName, TextMessage, ToolCallMessage
-from agent_migrator.tools.claude_code import ClaudeCodeAdapter
-from agent_migrator.tools.codex import CodexAdapter
+from agent_migrator.agents.claude_code import ClaudeCodeAdapter
+from agent_migrator.agents.codex import CodexAdapter
 
 CODEX_DEMO_PROJECT = Path("C:/Users/troyh/Documents/dev/codex-demo")
 NATIVE_SESSION_ID = "019d84ae-774f-7e02-8e71-f46a1509334a"
@@ -139,7 +139,7 @@ def t_codex_to_cc_write():
 
 def t_codex_to_cc_file_exists():
     assert cc_new_id, "write skipped"
-    from agent_migrator.tools.claude_code import encode_project_path, _projects_dir
+    from agent_migrator.agents.claude_code import encode_project_path, _projects_dir
     encoded = encode_project_path(CODEX_DEMO_PROJECT.resolve())
     jsonl = _projects_dir() / encoded / f"{cc_new_id}.jsonl"
     assert jsonl.exists(), f"Expected JSONL at {jsonl}"
@@ -168,7 +168,7 @@ if cc_new_id:
 print("\n=== 5. Claude Code -> Codex ===")
 
 # Find a native CC session from any project (prefer non-today sessions)
-from agent_migrator.tools.claude_code import _projects_dir
+from agent_migrator.agents.claude_code import _projects_dir
 import os
 
 cc_source_conv = None
@@ -217,7 +217,7 @@ def t_cc_to_codex_file_exists():
         print("  (skipped)")
         return
     rollout_file = None
-    from agent_migrator.tools.codex import _find_rollout_file
+    from agent_migrator.agents.codex import _find_rollout_file
     rollout_file = _find_rollout_file(codex_new_id)
     assert rollout_file and rollout_file.exists(), f"Rollout file not found for {codex_new_id}"
     print(f"  Rollout file: {rollout_file.name}")
@@ -226,7 +226,7 @@ def t_cc_to_codex_session_meta():
     if codex_new_id is None:
         print("  (skipped)")
         return
-    from agent_migrator.tools.codex import _find_rollout_file, _read_session_meta
+    from agent_migrator.agents.codex import _find_rollout_file, _read_session_meta
     rollout_file = _find_rollout_file(codex_new_id)
     meta = _read_session_meta(rollout_file)
     assert meta, "session_meta not written"
@@ -260,7 +260,7 @@ print("\n=== 6. Atomic write / cleanup ===")
 
 def t_no_tmp_on_failure():
     import tempfile, shutil
-    from agent_migrator.tools.codex import _sessions_dir
+    from agent_migrator.agents.codex import _sessions_dir
     # Use a read-only temp dir to force failure after tmp creation
     tmp_dir = Path(tempfile.mkdtemp())
     try:

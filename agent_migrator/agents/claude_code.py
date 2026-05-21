@@ -16,7 +16,7 @@ from agent_migrator.models import (
     ToolCallMessage,
     inject_exit_plan_mode,
 )
-from agent_migrator.tools.base import ToolAdapter
+from agent_migrator.agents.base import AgentAdapter
 
 # Record types to skip when reading conversations
 _SKIP_TYPES = {"file-history-snapshot", "progress", "system"}
@@ -309,7 +309,7 @@ def _structured_patch(old_string: str, new_string: str) -> list[dict]:
     return hunks
 
 
-class ClaudeCodeAdapter(ToolAdapter):
+class ClaudeCodeAdapter(AgentAdapter):
     name = "Claude Code"
     tool_id = "claude_code"
 

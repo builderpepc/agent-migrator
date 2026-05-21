@@ -19,10 +19,10 @@ from agent_migrator.models import (
     ToolCallMessage,
     inject_exit_plan_mode,
 )
-from agent_migrator.tools.base import ToolAdapter, ToolNetworkError
+from agent_migrator.agents.base import AgentAdapter, AgentNetworkError
 
 
-class ServerUploadError(ToolNetworkError):
+class ServerUploadError(AgentNetworkError):
     """Raised when the ConvertOALToNAL server call fails (auth, network, etc.)."""
 
 
@@ -1203,7 +1203,7 @@ def _first_user_text(global_db: sqlite3.Connection, composer_id: str, bubble_ite
     return composer_id[:8]
 
 
-class CursorAdapter(ToolAdapter):
+class CursorAdapter(AgentAdapter):
     name = "Cursor"
     tool_id = "cursor"
 

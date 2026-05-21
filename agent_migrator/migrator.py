@@ -4,14 +4,14 @@ from pathlib import Path
 from typing import Callable
 
 from agent_migrator.models import ConversationInfo, MigrationResult
-from agent_migrator.tools.base import ToolAdapter
+from agent_migrator.agents.base import AgentAdapter
 
 
 class MigrationEngine:
     def migrate_one(
         self,
-        source: ToolAdapter,
-        dest: ToolAdapter,
+        source: AgentAdapter,
+        dest: AgentAdapter,
         conv_info: ConversationInfo,
         project_path: Path,
         on_progress: Callable[[str], None],
@@ -33,8 +33,8 @@ class MigrationEngine:
 
     def migrate_many(
         self,
-        source: ToolAdapter,
-        dest: ToolAdapter,
+        source: AgentAdapter,
+        dest: AgentAdapter,
         conversations: list[ConversationInfo],
         project_path: Path,
         on_progress: Callable[[str], None],

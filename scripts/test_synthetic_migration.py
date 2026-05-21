@@ -33,9 +33,9 @@ from agent_migrator.models import (
     TextMessage,
     ToolCallMessage,
 )
-from agent_migrator.tools.claude_code import ClaudeCodeAdapter
-from agent_migrator.tools.codex import CodexAdapter
-from agent_migrator.tools.cursor import CursorAdapter
+from agent_migrator.agents.claude_code import ClaudeCodeAdapter
+from agent_migrator.agents.codex import CodexAdapter
+from agent_migrator.agents.cursor import CursorAdapter
 
 TEST_DIR = Path("C:/Users/troyh/Documents/dev/agent-migrator-synthetic-test")
 TEST_DIR.mkdir(parents=True, exist_ok=True)
@@ -265,7 +265,7 @@ cc = ClaudeCodeAdapter()
 cc_id = run("CC write", lambda: cc.write_conversation(conv, TEST_DIR))
 if cc_id:
     written["CC"] = cc_id
-    from agent_migrator.tools.claude_code import encode_project_path, _projects_dir
+    from agent_migrator.agents.claude_code import encode_project_path, _projects_dir
     encoded = encode_project_path(TEST_DIR.resolve())
     jsonl = _projects_dir() / encoded / f"{cc_id}.jsonl"
     print(f"         -> {jsonl}")
@@ -276,7 +276,7 @@ if codex.is_available():
     codex_id = run("Codex write", lambda: codex.write_conversation(conv, TEST_DIR))
     if codex_id:
         written["Codex"] = codex_id
-        from agent_migrator.tools.codex import _find_rollout_file
+        from agent_migrator.agents.codex import _find_rollout_file
         rollout = _find_rollout_file(codex_id)
         print(f"         -> {rollout}")
 else:

@@ -88,14 +88,14 @@ If a source tool uses a native tool name that has no standard equivalent, pass i
 
 ---
 
-## The `ToolAdapter` ABC (`tools/base.py`)
+## The `AgentAdapter` ABC (`tools/base.py`)
 
 Create a subclass and implement all five methods:
 
 ```python
-from agent_migrator.tools.base import ToolAdapter, ToolNetworkError
+from agent_migrator.agents.base import AgentAdapter, AgentNetworkError
 
-class MyToolAdapter(ToolAdapter):
+class MyAgentAdapter(AgentAdapter):
     name = "My Tool"       # shown in the TUI
     tool_id = "my_tool"    # used in ConversationInfo.source_tool; must be unique
 
@@ -133,7 +133,7 @@ class MyToolAdapter(ToolAdapter):
 Add your adapter to the list in `cli.py`:
 
 ```python
-all_adapters = [CursorAdapter(), ClaudeCodeAdapter(), MyToolAdapter()]
+all_adapters = [CursorAdapter(), ClaudeCodeAdapter(), MyAgentAdapter()]
 ```
 
 ---
@@ -172,18 +172,18 @@ native_name = _STANDARD_TO_MY_TOOL.get(tc.name, tc.name)
 
 ---
 
-## `use_local_backend` and `ToolNetworkError`
+## `use_local_backend` and `AgentNetworkError`
 
 Some tools support two write paths: uploading conversation history to a remote server (which makes it available across machines and in the cloud UI), and writing directly to local storage (which works offline but may limit functionality).
 
 **If your tool has a remote upload path:**
 
 1. By default (`use_local_backend=False`), attempt the remote upload.
-2. If the upload fails for any network or auth reason, raise `ToolNetworkError` (or a subclass).
+2. If the upload fails for any network or auth reason, raise `AgentNetworkError` (or a subclass).
 3. When `use_local_backend=True`, skip the upload and write locally.
 
 ```python
-class MyToolUploadError(ToolNetworkError):
+class MyToolUploadError(AgentNetworkError):
     """Raised when the remote upload to My Tool's server fails."""
 
 def write_conversation(self, conv, project_path, *, use_local_backend=False):
@@ -198,7 +198,7 @@ def write_conversation(self, conv, project_path, *, use_local_backend=False):
     return new_id
 ```
 
-`cli.py` catches `ToolNetworkError` (the base class) and offers the user a chance to retry with `use_local_backend=True`. It does not need to know which adapter or subclass is involved.
+`cli.py` catches `AgentNetworkError` (the base class) and offers the user a chance to retry with `use_local_backend=True`. It does not need to know which adapter or subclass is involved.
 
 **If your tool has no remote path**, simply ignore `use_local_backend` — it defaults to `False` and the base class signature accepts it without any action required on your part.
 
@@ -240,12 +240,12 @@ finally:
 
 ```
 Exception
-└── ToolNetworkError                  (base.py)
+└── AgentNetworkError                  (base.py)
     └── ServerUploadError             (cursor.py — Cursor-specific)
     └── YourToolUploadError           (your_tool.py — add here)
 ```
 
-Only subclass `ToolNetworkError` for failures where `use_local_backend=True` is a meaningful retry. Other errors (file not found, corrupt data, etc.) should propagate as standard Python exceptions.
+Only subclass `AgentNetworkError` for failures where `use_local_backend=True` is a meaningful retry. Other errors (file not found, corrupt data, etc.) should propagate as standard Python exceptions.
 
 ---
 
@@ -258,6 +258,6 @@ After implementing your adapter, test these scenarios manually:
 3. **Read → Write (round-trip)**: migrate a multi-turn conversation with tool calls from your tool to Claude Code (or Cursor); open the result and confirm the history is readable.
 4. **Write → Read (round-trip)**: migrate from Claude Code (or Cursor) into your tool; open the result in your tool's UI and confirm the history appears.
 5. **Atomic write**: kill the process mid-write (or simulate an error); confirm no partial files or DB entries remain.
-6. **`use_local_backend`** (if applicable): trigger a server upload failure; confirm `ToolNetworkError` is raised; accept the fallback prompt; confirm the local path succeeds.
+6. **`use_local_backend`** (if applicable): trigger a server upload failure; confirm `AgentNetworkError` is raised; accept the fallback prompt; confirm the local path succeeds.
 7. **`plan_content`**: migrate a conversation that includes a plan; confirm the plan appears in the destination tool.
 8. **Unknown tool names**: if the source contains tool calls not in `StandardToolName`, confirm they pass through without crashing.
