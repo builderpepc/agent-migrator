@@ -17,6 +17,10 @@ from agent_migrator.models import (
 )
 from agent_migrator.tools.base import ToolAdapter
 
+_PROPOSED_PLAN_DISPLAY_RE = re.compile(
+    r"\s*<proposed_plan>(.*?)</proposed_plan>\s*", re.DOTALL | re.IGNORECASE
+)
+
 # ---------------------------------------------------------------------------
 # Storage paths
 # ---------------------------------------------------------------------------
@@ -114,6 +118,75 @@ def _apply_patch_edit(file_path: str, old_string: str, new_string: str) -> str:
         f"*** Begin Patch\n*** Update File: {file_path}\n@@\n"
         f"{old_lines}\n{new_lines}\n*** End Patch"
     )
+
+
+def _parse_apply_patch_changes(patch_input: str) -> dict:
+    """
+    Parse an apply_patch payload into the changes dict expected by patch_apply_end.
+
+    Handles single-file patches (Add File / Update File / Delete File).
+    Returns: {file_path: {"type": "add"|"update"|"delete", ...}}
+    """
+    changes: dict = {}
+    current_file: str | None = None
+    current_type: str | None = None
+    current_lines: list[str] = []
+
+    def _flush():
+        if not current_file or not current_type:
+            return
+        if current_type == "add":
+            content = "\n".join(
+                ln[1:] if ln.startswith("+") else ln for ln in current_lines
+            )
+            changes[current_file] = {"type": "add", "content": content}
+        elif current_type == "update":
+            old_lines = [ln[1:] for ln in current_lines if ln.startswith("-")]
+            new_lines = [ln[1:] for ln in current_lines if ln.startswith("+")]
+            diff = f"@@ -1,{len(old_lines)} +1,{len(new_lines)} @@\n"
+            diff += "\n".join(f"-{l}" for l in old_lines)
+            if old_lines and new_lines:
+                diff += "\n"
+            diff += "\n".join(f"+{l}" for l in new_lines)
+            changes[current_file] = {
+                "type": "update",
+                "unified_diff": diff,
+                "move_path": None,
+            }
+        elif current_type == "delete":
+            content = "\n".join(
+                ln[1:] if ln.startswith("-") else ln for ln in current_lines
+            )
+            changes[current_file] = {"type": "delete", "content": content}
+
+    for raw_line in patch_input.splitlines():
+        if raw_line in ("*** Begin Patch", "*** End Patch", "@@"):
+            if raw_line == "*** End Patch":
+                _flush()
+                current_file = None
+                current_type = None
+                current_lines = []
+            continue
+        if raw_line.startswith("*** Add File: "):
+            _flush()
+            current_file = raw_line[len("*** Add File: "):]
+            current_type = "add"
+            current_lines = []
+        elif raw_line.startswith("*** Update File: "):
+            _flush()
+            current_file = raw_line[len("*** Update File: "):]
+            current_type = "update"
+            current_lines = []
+        elif raw_line.startswith("*** Delete File: "):
+            _flush()
+            current_file = raw_line[len("*** Delete File: "):]
+            current_type = "delete"
+            current_lines = []
+        elif current_file is not None:
+            current_lines.append(raw_line)
+
+    _flush()
+    return changes
 
 
 # ---------------------------------------------------------------------------
@@ -515,11 +588,11 @@ class CodexAdapter(ToolAdapter):
         session_id = _uuid7()
 
         ts_str = now.strftime("%Y-%m-%dT%H-%M-%S")
-        slug_base = re.sub(r"[^a-z0-9]+", "_", conv.info.name.lower()).strip("_")[:40]
-        filename = f"rollout-{ts_str}-{session_id}"
-        if slug_base:
-            filename += f"-{slug_base}"
-        filename += ".jsonl"
+        # Codex's filename parser (parse_timestamp_uuid_from_filename) scans from
+        # the RIGHT for a segment that parses as a UUID.  Any suffix after the UUID
+        # (e.g. a human-readable slug) breaks this scan — the file would be silently
+        # skipped and never appear in /resume.  Native Codex never appends a slug.
+        filename = f"rollout-{ts_str}-{session_id}.jsonl"
 
         target_dir = (
             _sessions_dir()
@@ -537,177 +610,300 @@ class CodexAdapter(ToolAdapter):
         # install).  Migrated sessions must use "openai" to appear in /resume.
         model_provider = "openai"
 
-        def _make_record(rtype: str, payload: dict) -> str:
-            rec = {
-                "timestamp": _now_iso(),
-                "type": rtype,
-                "payload": payload,
-            }
-            return json.dumps(rec, ensure_ascii=False)
+        def _make_event(payload: dict) -> str:
+            """Wrap a payload as an event_msg record."""
+            return json.dumps(
+                {"timestamp": _now_iso(), "type": "event_msg", "payload": payload},
+                ensure_ascii=False,
+            )
+
+        def _make_response_item(ts: str, payload: dict) -> str:
+            return json.dumps(
+                {"timestamp": ts, "type": "response_item", "payload": payload},
+                ensure_ascii=False,
+            )
 
         def _new_call_id() -> str:
             return f"call_{uuid.uuid4().hex[:24]}"
 
+        # ── Group turns into (user_turn, [agent_turns]) exchanges ────────────
+        # Each exchange begins with a user TextMessage (or None for leading agent
+        # turns) and contains all subsequent non-user turns until the next user
+        # TextMessage.
+        exchanges: list[tuple] = []
+        cur_user: TextMessage | None = None
+        cur_agent: list = []
+        for turn in conv.turns:
+            if isinstance(turn, TextMessage) and turn.role == "user":
+                exchanges.append((cur_user, cur_agent))
+                cur_user = turn
+                cur_agent = []
+            else:
+                cur_agent.append(turn)
+        exchanges.append((cur_user, cur_agent))
+        # Drop any leading (None, []) placeholder
+        exchanges = [(u, a) for u, a in exchanges if u is not None or a]
+
+        # Whether the plan is already embedded in an assistant turn
+        plan_already_written = conv.plan_content is not None and any(
+            isinstance(t, TextMessage)
+            and t.role == "assistant"
+            and "<proposed_plan>" in t.text
+            for t in conv.turns
+        )
+
+        cwd_str = str(project_path.resolve())
+
         try:
             with open(tmp_path, "w", encoding="utf-8") as f:
-                # Session meta (first record)
-                f.write(_make_record("session_meta", {
-                    "id": session_id,
+                # ── Session meta (first record) ──────────────────────────────
+                f.write(json.dumps({
                     "timestamp": now.isoformat(),
-                    "cwd": str(project_path.resolve()),
-                    "originator": "agent-migrator",
-                    "cli_version": "0.120.0",
-                    "source": "cli",
-                    "model_provider": model_provider,
-                }) + "\n")
+                    "type": "session_meta",
+                    "payload": {
+                        "id": session_id,
+                        "timestamp": now.isoformat(),
+                        "cwd": cwd_str,
+                        "originator": "agent-migrator",
+                        "cli_version": "0.120.0",
+                        "source": "cli",
+                        "model_provider": model_provider,
+                    },
+                }, ensure_ascii=False) + "\n")
 
-                # Track whether plan has already been written (present in an assistant turn)
-                plan_already_written = conv.plan_content is not None and any(
-                    isinstance(t, TextMessage)
-                    and t.role == "assistant"
-                    and "<proposed_plan>" in t.text
-                    for t in conv.turns
-                )
+                # ── Exchanges ────────────────────────────────────────────────
+                for user_turn, agent_turns in exchanges:
+                    turn_id = _uuid7()
+                    turn_ts = (
+                        user_turn.timestamp.isoformat()
+                        if user_turn and user_turn.timestamp
+                        else _now_iso()
+                    )
 
-                for turn in conv.turns:
-                    turn_ts = turn.timestamp.isoformat() if turn.timestamp else _now_iso()
+                    # task_started — required for /resume list display
+                    started_at = (
+                        int(user_turn.timestamp.timestamp())
+                        if user_turn and user_turn.timestamp
+                        else None
+                    )
+                    f.write(_make_event({
+                        "type": "task_started",
+                        "turn_id": turn_id,
+                        "started_at": started_at,
+                        "model_context_window": None,
+                        "collaboration_mode_kind": "default",
+                    }) + "\n")
 
-                    if isinstance(turn, TextMessage):
-                        content_type = "input_text" if turn.role == "user" else "output_text"
-                        payload = {
+                    # User message
+                    if user_turn:
+                        f.write(_make_event({
+                            "type": "user_message",
+                            "message": user_turn.text,
+                            "images": [],
+                            "local_images": [],
+                            "text_elements": [],
+                        }) + "\n")
+                        f.write(_make_response_item(turn_ts, {
                             "type": "message",
-                            "role": turn.role,
-                            "content": [{"type": content_type, "text": turn.text}],
-                        }
-                        rec = {
-                            "timestamp": turn_ts,
-                            "type": "response_item",
-                            "payload": payload,
-                        }
-                        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": user_turn.text}],
+                        }) + "\n")
 
-                    elif isinstance(turn, ToolCallMessage):
-                        call_id = _new_call_id()
-                        name = turn.name
+                    # Agent turns
+                    for turn in agent_turns:
+                        t_ts = (
+                            turn.timestamp.isoformat()
+                            if turn.timestamp
+                            else _now_iso()
+                        )
 
-                        if name in _APPLY_PATCH_TOOLS or (
-                            name not in _SHELL_COMMAND_TOOLS
-                            and name == "apply_patch"
-                        ):
-                            # custom_tool_call with apply_patch format
-                            if name == StandardToolName.WRITE:
-                                patch_input = _apply_patch_write(
-                                    turn.input.get("file_path", ""),
-                                    turn.input.get("content", ""),
-                                )
-                            elif name == StandardToolName.EDIT:
-                                patch_input = _apply_patch_edit(
-                                    turn.input.get("file_path", ""),
-                                    turn.input.get("old_string", ""),
-                                    turn.input.get("new_string", ""),
-                                )
-                            else:
-                                # Passthrough: raw patch already stored
-                                patch_input = turn.input.get("patch", json.dumps(turn.input))
+                        if isinstance(turn, TextMessage):
+                            # response_item/message/assistant — keep full text (round-trip)
+                            f.write(_make_response_item(t_ts, {
+                                "type": "message",
+                                "role": "assistant",
+                                "content": [{"type": "output_text", "text": turn.text}],
+                            }) + "\n")
+                            # event_msg/agent_message — TUI display; strip <proposed_plan>
+                            # XML so raw tags don't appear as literal text.
+                            display_text = _PROPOSED_PLAN_DISPLAY_RE.sub(
+                                lambda m: "\n\n" + m.group(1).strip() + "\n\n", turn.text
+                            ).strip()
+                            if display_text:
+                                f.write(_make_event({
+                                    "type": "agent_message",
+                                    "message": display_text,
+                                    "phase": "commentary",
+                                    "memory_citation": None,
+                                }) + "\n")
 
-                            call_rec = {
-                                "timestamp": turn_ts,
-                                "type": "response_item",
-                                "payload": {
+                        elif isinstance(turn, ToolCallMessage):
+                            call_id = _new_call_id()
+                            name = turn.name
+
+                            if name in _APPLY_PATCH_TOOLS or name == "apply_patch":
+                                # ── apply_patch (Write / Edit) ───────────────
+                                if name == StandardToolName.WRITE:
+                                    patch_input = _apply_patch_write(
+                                        turn.input.get("file_path", ""),
+                                        turn.input.get("content", ""),
+                                    )
+                                elif name == StandardToolName.EDIT:
+                                    patch_input = _apply_patch_edit(
+                                        turn.input.get("file_path", ""),
+                                        turn.input.get("old_string", ""),
+                                        turn.input.get("new_string", ""),
+                                    )
+                                else:
+                                    patch_input = turn.input.get(
+                                        "patch", json.dumps(turn.input)
+                                    )
+
+                                f.write(_make_response_item(t_ts, {
                                     "type": "custom_tool_call",
                                     "name": "apply_patch",
                                     "input": patch_input,
                                     "call_id": call_id,
                                     "status": "completed",
-                                },
-                            }
-                            result_rec = {
-                                "timestamp": turn_ts,
-                                "type": "response_item",
-                                "payload": {
+                                }) + "\n")
+
+                                # event_msg/patch_apply_begin + patch_apply_end pair.
+                                # NOTE: patch_apply_end{success=true} is a no-op in TUI
+                                # history replay — the "Edited" block is only added by
+                                # on_patch_apply_begin during live sessions.  We emit a
+                                # synthetic agent_message per changed file so that file
+                                # operations are visible in the /resume history view.
+                                changes = _parse_apply_patch_changes(patch_input)
+                                for changed_path, change_info in changes.items():
+                                    change_type = change_info.get("type", "update")
+                                    verb = {"add": "Created", "delete": "Deleted"}.get(
+                                        change_type, "Updated"
+                                    )
+                                    f.write(_make_event({
+                                        "type": "agent_message",
+                                        "message": f"{verb} `{changed_path}`",
+                                        "phase": "commentary",
+                                        "memory_citation": None,
+                                    }) + "\n")
+                                f.write(_make_event({
+                                    "type": "patch_apply_begin",
+                                    "call_id": call_id,
+                                    "turn_id": turn_id,
+                                    "auto_approved": True,
+                                    "changes": changes,
+                                }) + "\n")
+                                f.write(_make_event({
+                                    "type": "patch_apply_end",
+                                    "call_id": call_id,
+                                    "turn_id": turn_id,
+                                    "stdout": turn.result or "Applied.",
+                                    "stderr": "",
+                                    "success": True,
+                                    "changes": changes,
+                                    "status": "completed",
+                                }) + "\n")
+
+                                f.write(_make_response_item(t_ts, {
                                     "type": "custom_tool_call_output",
                                     "call_id": call_id,
                                     "output": turn.result,
-                                },
-                            }
-                        else:
-                            # function_call with shell_command
-                            if name == StandardToolName.BASH:
-                                arguments = {"command": turn.input.get("command", "")}
-                            elif name == StandardToolName.READ:
-                                fp = turn.input.get("file_path", "")
-                                arguments = {"command": f"cat {fp}"}
-                            elif name == StandardToolName.GREP:
-                                pattern = turn.input.get("pattern", "")
-                                path_arg = turn.input.get("path", ".")
-                                arguments = {"command": f"grep -r {json.dumps(pattern)} {path_arg}"}
-                            elif name == StandardToolName.GLOB:
-                                glob_pattern = turn.input.get("pattern", "*")
-                                arguments = {"command": f"find . -name {json.dumps(glob_pattern)}"}
-                            else:
-                                # Passthrough: preserve the native/unknown tool name as-is.
-                                # Don't remap to shell_command — that would lose the name on read.
-                                call_rec = {
-                                    "timestamp": turn_ts,
-                                    "type": "response_item",
-                                    "payload": {
-                                        "type": "function_call",
-                                        "name": name,
-                                        "arguments": json.dumps(turn.input or {}),
-                                        "call_id": call_id,
-                                    },
-                                }
-                                result_rec = {
-                                    "timestamp": turn_ts,
-                                    "type": "response_item",
-                                    "payload": {
-                                        "type": "function_call_output",
-                                        "call_id": call_id,
-                                        "output": turn.result,
-                                    },
-                                }
-                                f.write(json.dumps(call_rec, ensure_ascii=False) + "\n")
-                                f.write(json.dumps(result_rec, ensure_ascii=False) + "\n")
-                                continue  # skip the common write below
+                                }) + "\n")
 
-                            call_rec = {
-                                "timestamp": turn_ts,
-                                "type": "response_item",
-                                "payload": {
+                            elif name in _SHELL_COMMAND_TOOLS:
+                                # ── shell_command (Bash / Read / Grep / Glob) ─
+                                if name == StandardToolName.BASH:
+                                    cmd_str = turn.input.get("command", "")
+                                elif name == StandardToolName.READ:
+                                    cmd_str = f"cat {turn.input.get('file_path', '')}"
+                                elif name == StandardToolName.GREP:
+                                    pat = turn.input.get("pattern", "")
+                                    path_arg = turn.input.get("path", ".")
+                                    cmd_str = f"grep -r {json.dumps(pat)} {path_arg}"
+                                else:  # GLOB
+                                    cmd_str = (
+                                        f"find . -name {json.dumps(turn.input.get('pattern', '*'))}"
+                                    )
+
+                                f.write(_make_response_item(t_ts, {
                                     "type": "function_call",
                                     "name": "shell_command",
-                                    "arguments": json.dumps(arguments),
+                                    "arguments": json.dumps({"command": cmd_str}),
                                     "call_id": call_id,
-                                },
-                            }
-                            result_rec = {
-                                "timestamp": turn_ts,
-                                "type": "response_item",
-                                "payload": {
+                                }) + "\n")
+
+                                # event_msg/exec_command_end — TUI displays command output
+                                f.write(_make_event({
+                                    "type": "exec_command_end",
+                                    "call_id": call_id,
+                                    "process_id": None,
+                                    "turn_id": turn_id,
+                                    "command": ["bash", "-c", cmd_str],
+                                    "cwd": cwd_str,
+                                    "parsed_cmd": [{"type": "unknown", "cmd": cmd_str}],
+                                    "source": "agent",
+                                    "interaction_input": None,
+                                    "stdout": turn.result or "",
+                                    "stderr": "",
+                                    "aggregated_output": turn.result or "",
+                                    "exit_code": 0,
+                                    "duration": {"secs": 0, "nanos": 0},
+                                    "formatted_output": turn.result or "",
+                                    "status": "completed",
+                                }) + "\n")
+
+                                f.write(_make_response_item(t_ts, {
                                     "type": "function_call_output",
                                     "call_id": call_id,
                                     "output": turn.result,
-                                },
-                            }
+                                }) + "\n")
 
-                        f.write(json.dumps(call_rec, ensure_ascii=False) + "\n")
-                        f.write(json.dumps(result_rec, ensure_ascii=False) + "\n")
+                            else:
+                                # ── Passthrough (unknown tool) ────────────────
+                                f.write(_make_response_item(t_ts, {
+                                    "type": "function_call",
+                                    "name": name,
+                                    "arguments": json.dumps(turn.input or {}),
+                                    "call_id": call_id,
+                                }) + "\n")
+                                f.write(_make_response_item(t_ts, {
+                                    "type": "function_call_output",
+                                    "call_id": call_id,
+                                    "output": turn.result,
+                                }) + "\n")
 
-                # Append plan as a final assistant message if not already present
+                    # task_complete — closes out the exchange
+                    last_agent_text: str | None = None
+                    for t in reversed(agent_turns):
+                        if isinstance(t, TextMessage) and t.role == "assistant":
+                            last_agent_text = (t.text[:200] if t.text else None)
+                            break
+                    f.write(_make_event({
+                        "type": "task_complete",
+                        "turn_id": turn_id,
+                        "last_agent_message": last_agent_text,
+                        "completed_at": None,
+                        "duration_ms": None,
+                    }) + "\n")
+
+                # ── Append plan if not already embedded ──────────────────────
                 if conv.plan_content and not plan_already_written:
-                    plan_rec = {
-                        "timestamp": _now_iso(),
-                        "type": "response_item",
-                        "payload": {
-                            "type": "message",
-                            "role": "assistant",
-                            "content": [{
-                                "type": "output_text",
-                                "text": f"<proposed_plan>\n{conv.plan_content}\n</proposed_plan>",
-                            }],
-                        },
-                    }
-                    f.write(json.dumps(plan_rec, ensure_ascii=False) + "\n")
+                    # response_item keeps the XML wrapper so read_conversation() can
+                    # extract plan_content on round-trip; agent_message shows the
+                    # clean markdown without raw XML tags.
+                    plan_xml = (
+                        f"<proposed_plan>\n{conv.plan_content}\n</proposed_plan>"
+                    )
+                    f.write(_make_response_item(_now_iso(), {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": plan_xml}],
+                    }) + "\n")
+                    f.write(_make_event({
+                        "type": "agent_message",
+                        "message": conv.plan_content.strip(),
+                        "phase": "planning",
+                        "memory_citation": None,
+                    }) + "\n")
 
             # Atomic rename
             tmp_path.replace(final_path)

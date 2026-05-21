@@ -57,7 +57,14 @@ def _parse_timestamp(ts: str | None) -> datetime | None:
 
 
 def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    dt = datetime.now(timezone.utc)
+    return dt.strftime('%Y-%m-%dT%H:%M:%S.') + f'{dt.microsecond // 1000:03d}Z'
+
+
+def _ts_iso(dt: datetime) -> str:
+    """Format a datetime as a CC-compatible ISO timestamp (ms precision, Z suffix)."""
+    dt_utc = dt.astimezone(timezone.utc)
+    return dt_utc.strftime('%Y-%m-%dT%H:%M:%S.') + f'{dt_utc.microsecond // 1000:03d}Z'
 
 
 _TAIL_READ_BYTES = 32768  # 32 KB — enough to find appended title fields
@@ -532,6 +539,13 @@ class ClaudeCodeAdapter(ToolAdapter):
 
         try:
             with open(tmp_path, "w", encoding="utf-8") as f:
+                # Leading permission-mode record (required by CC 2.1.x+)
+                f.write(json.dumps({
+                    "type": "permission-mode",
+                    "permissionMode": "default",
+                    "sessionId": session_id,
+                }) + "\n")
+
                 prev_uuid: str | None = None
 
                 def _make_base(rec_type: str, rec_uuid: str, ts: str) -> dict:
@@ -545,6 +559,9 @@ class ClaudeCodeAdapter(ToolAdapter):
                         "userType": "external",
                         "cwd": str(project_path),
                         "slug": slug,
+                        "version": "2.1.145",
+                        "entrypoint": "cli",
+                        "gitBranch": "HEAD",
                     }
 
                 def _msg_id() -> str:
@@ -613,9 +630,12 @@ class ClaudeCodeAdapter(ToolAdapter):
                     # One assistant record with all tool_use blocks
                     asst_uuid = str(uuid.uuid4())
                     asst_record = _make_base("assistant", asst_uuid, ts)
+                    asst_record["requestId"] = f"req_{uuid.uuid4().hex[:24]}"
                     asst_record["message"] = {
                         "id": _msg_id(),
+                        "type": "message",
                         "role": "assistant",
+                        "model": conv.model or "claude-sonnet-4-6",
                         "content": [
                             {
                                 "type": "tool_use",
@@ -625,6 +645,11 @@ class ClaudeCodeAdapter(ToolAdapter):
                             }
                             for tool_use_id, tc in tool_batch
                         ],
+                        "stop_reason": "tool_use",
+                        "stop_sequence": None,
+                        "stop_details": None,
+                        "usage": {"input_tokens": 0, "output_tokens": 0, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0},
+                        "diagnostics": None,
                     }
                     f.write(json.dumps(asst_record) + "\n")
                     prev_uuid = asst_uuid
@@ -633,6 +658,8 @@ class ClaudeCodeAdapter(ToolAdapter):
                     for tool_use_id, tc in tool_batch:
                         result_uuid = str(uuid.uuid4())
                         result_record = _make_base("user", result_uuid, ts)
+                        result_record["promptId"] = str(uuid.uuid4())
+                        result_record["permissionMode"] = "default"
                         result_record["message"] = {
                             "role": "user",
                             "content": [
@@ -658,11 +685,13 @@ class ClaudeCodeAdapter(ToolAdapter):
                 i = 0
                 while i < len(turns):
                     turn = turns[i]
-                    ts = turn.timestamp.isoformat() if turn.timestamp else _now_iso()
+                    ts = _ts_iso(turn.timestamp) if turn.timestamp else _now_iso()
 
                     if isinstance(turn, TextMessage) and turn.role == "user":
                         rec_uuid = str(uuid.uuid4())
                         record = _make_base("user", rec_uuid, ts)
+                        record["promptId"] = str(uuid.uuid4())
+                        record["permissionMode"] = "default"
                         record["message"] = {"role": "user", "content": turn.text}
                         f.write(json.dumps(record) + "\n")
                         prev_uuid = rec_uuid
@@ -688,10 +717,18 @@ class ClaudeCodeAdapter(ToolAdapter):
 
                         asst_uuid = str(uuid.uuid4())
                         asst_record = _make_base("assistant", asst_uuid, ts)
+                        asst_record["requestId"] = f"req_{uuid.uuid4().hex[:24]}"
                         asst_record["message"] = {
                             "id": _msg_id(),
+                            "type": "message",
                             "role": "assistant",
+                            "model": conv.model or "claude-sonnet-4-6",
                             "content": content_blocks,
+                            "stop_reason": "tool_use" if tool_batch else "end_turn",
+                            "stop_sequence": None,
+                            "stop_details": None,
+                            "usage": {"input_tokens": 0, "output_tokens": 0, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0},
+                            "diagnostics": None,
                         }
                         f.write(json.dumps(asst_record) + "\n")
                         prev_uuid = asst_uuid
@@ -700,6 +737,8 @@ class ClaudeCodeAdapter(ToolAdapter):
                             for tuid, tc in tool_batch:
                                 result_uuid = str(uuid.uuid4())
                                 result_record = _make_base("user", result_uuid, ts)
+                                result_record["promptId"] = str(uuid.uuid4())
+                                result_record["permissionMode"] = "default"
                                 result_record["message"] = {
                                     "role": "user",
                                     "content": [
