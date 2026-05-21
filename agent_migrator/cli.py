@@ -42,8 +42,9 @@ def main() -> None:
     from agent_migrator.tools.claude_code import ClaudeCodeAdapter
     from agent_migrator.tools.codex import CodexAdapter
     from agent_migrator.tools.cursor import CursorAdapter
+    from agent_migrator.tools.gemini import GeminiAdapter
 
-    all_adapters = [CursorAdapter(), ClaudeCodeAdapter(), CodexAdapter()]
+    all_adapters = [CursorAdapter(), ClaudeCodeAdapter(), CodexAdapter(), GeminiAdapter()]
     available = [a for a in all_adapters if a.is_available()]
 
     if len(available) < 2:
