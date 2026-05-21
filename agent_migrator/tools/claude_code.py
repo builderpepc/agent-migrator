@@ -21,6 +21,19 @@ from agent_migrator.tools.base import ToolAdapter
 # Record types to skip when reading conversations
 _SKIP_TYPES = {"file-history-snapshot", "progress", "system"}
 
+# CC-internal tool names that have no portable meaning outside Claude Code.
+# These are dropped during read_conversation() so they never reach destination
+# adapters.  ExitPlanMode is handled separately via plan_content extraction.
+_CC_INTERNAL_TOOLS = {
+    "ToolSearch",
+    "EnterPlanMode",
+    "ExitPlanMode",
+    "ExitPlanModeV2",
+    "exit-plan-mode-v2",
+    "ListMcpResourcesTool",
+    "ReadMcpResourceTool",
+}
+
 
 def _claude_dir() -> Path:
     return Path.home() / ".claude"
@@ -389,8 +402,17 @@ class ClaudeCodeAdapter(ToolAdapter):
                                         timestamp=_parse_timestamp(rec.get("timestamp")),
                                     ))
                             elif btype == "tool_use":
+                                tool_name = block.get("name", "unknown")
+                                # Drop CC-internal tools (plan-mode markers, ToolSearch,
+                                # MCP plugin tools) — they have no portable meaning and
+                                # must not appear verbatim in destination adapters.
+                                if (
+                                    tool_name in _CC_INTERNAL_TOOLS
+                                    or tool_name.startswith("mcp__")
+                                ):
+                                    continue
                                 tc = ToolCallMessage(
-                                    name=block.get("name", "unknown"),
+                                    name=tool_name,
                                     input=block.get("input", {}),
                                     result="",
                                     timestamp=_parse_timestamp(rec.get("timestamp")),
