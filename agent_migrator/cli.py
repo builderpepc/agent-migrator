@@ -139,8 +139,8 @@ def main() -> None:
                 console.print(" [green]done[/green]")
             except Exception as e:
                 # Check if this is a network upload failure that can fall back to local.
-                from agent_migrator.tools.base import ToolNetworkError
-                if isinstance(e, ToolNetworkError) and not use_local_fallback_decided:
+                from agent_migrator.tools.base import AgentNetworkError
+                if isinstance(e, AgentNetworkError) and not use_local_fallback_decided:
                     use_local_fallback_decided = True
                     console.print(f" [yellow]server upload failed[/yellow]")
                     console.print(
@@ -168,7 +168,7 @@ def main() -> None:
                             continue
                     else:
                         results.failed.append((conv_info, str(e)))
-                elif isinstance(e, ToolNetworkError) and use_local_fallback:
+                elif isinstance(e, AgentNetworkError) and use_local_fallback:
                     # Already decided to use fallback — retry silently.
                     try:
                         conv = src.read_conversation(conv_info.id, project_path)

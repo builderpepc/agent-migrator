@@ -16,7 +16,7 @@ from agent_migrator.models import (
     ToolCallMessage,
     inject_exit_plan_mode,
 )
-from agent_migrator.tools.base import ToolAdapter
+from agent_migrator.tools.base import AgentAdapter
 
 _GEMINI_STORAGE = Path.home() / ".gemini" / "tmp"
 
@@ -108,7 +108,7 @@ def _find_session_file(chats_dir: Path, conv_id: str) -> Path | None:
     return best[1] if best else None
 
 
-class GeminiAdapter(ToolAdapter):
+class GeminiAdapter(AgentAdapter):
     name = "Gemini"
     tool_id = "gemini"
 

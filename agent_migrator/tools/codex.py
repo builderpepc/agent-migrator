@@ -15,7 +15,7 @@ from agent_migrator.models import (
     TextMessage,
     ToolCallMessage,
 )
-from agent_migrator.tools.base import ToolAdapter
+from agent_migrator.tools.base import AgentAdapter
 
 _PROPOSED_PLAN_DISPLAY_RE = re.compile(
     r"\s*<proposed_plan>(.*?)</proposed_plan>\s*", re.DOTALL | re.IGNORECASE
@@ -409,7 +409,7 @@ def _extract_display_name(path: Path, session_id: str) -> str:
 # CodexAdapter
 # ---------------------------------------------------------------------------
 
-class CodexAdapter(ToolAdapter):
+class CodexAdapter(AgentAdapter):
     name = "Codex"
     tool_id = "codex"
 
