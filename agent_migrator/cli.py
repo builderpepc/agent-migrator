@@ -39,10 +39,10 @@ def main() -> None:
         console.print(f"[red]Error:[/red] path does not exist: {project_path}")
         sys.exit(1)
 
-    from agent_migrator.tools.claude_code import ClaudeCodeAdapter
-    from agent_migrator.tools.codex import CodexAdapter
-    from agent_migrator.tools.cursor import CursorAdapter
-    from agent_migrator.tools.gemini import GeminiAdapter
+    from agent_migrator.agents.claude_code import ClaudeCodeAdapter
+    from agent_migrator.agents.codex import CodexAdapter
+    from agent_migrator.agents.cursor import CursorAdapter
+    from agent_migrator.agents.gemini import GeminiAdapter
 
     all_adapters = [CursorAdapter(), ClaudeCodeAdapter(), CodexAdapter(), GeminiAdapter()]
     available = [a for a in all_adapters if a.is_available()]
@@ -139,7 +139,7 @@ def main() -> None:
                 console.print(" [green]done[/green]")
             except Exception as e:
                 # Check if this is a network upload failure that can fall back to local.
-                from agent_migrator.tools.base import AgentNetworkError
+                from agent_migrator.agents.base import AgentNetworkError
                 if isinstance(e, AgentNetworkError) and not use_local_fallback_decided:
                     use_local_fallback_decided = True
                     console.print(f" [yellow]server upload failed[/yellow]")

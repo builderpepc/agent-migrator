@@ -19,7 +19,7 @@ from agent_migrator.models import (
     ToolCallMessage,
     inject_exit_plan_mode,
 )
-from agent_migrator.tools.base import AgentAdapter, AgentNetworkError
+from agent_migrator.agents.base import AgentAdapter, AgentNetworkError
 
 
 class ServerUploadError(AgentNetworkError):

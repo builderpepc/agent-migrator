@@ -93,7 +93,7 @@ If a source tool uses a native tool name that has no standard equivalent, pass i
 Create a subclass and implement all five methods:
 
 ```python
-from agent_migrator.tools.base import AgentAdapter, AgentNetworkError
+from agent_migrator.agents.base import AgentAdapter, AgentNetworkError
 
 class MyAgentAdapter(AgentAdapter):
     name = "My Tool"       # shown in the TUI

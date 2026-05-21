@@ -16,7 +16,7 @@ from agent_migrator.models import (
     ToolCallMessage,
     inject_exit_plan_mode,
 )
-from agent_migrator.tools.base import AgentAdapter
+from agent_migrator.agents.base import AgentAdapter
 
 _GEMINI_STORAGE = Path.home() / ".gemini" / "tmp"
 

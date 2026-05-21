@@ -15,7 +15,7 @@ from agent_migrator.models import (
     TextMessage,
     ToolCallMessage,
 )
-from agent_migrator.tools.base import AgentAdapter
+from agent_migrator.agents.base import AgentAdapter
 
 _PROPOSED_PLAN_DISPLAY_RE = re.compile(
     r"\s*<proposed_plan>(.*?)</proposed_plan>\s*", re.DOTALL | re.IGNORECASE

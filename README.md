@@ -74,11 +74,11 @@ All pairs support:
 
 ## How it works
 
-Conversations are read into a tool-agnostic normalized format (`TextMessage` and `ToolCallMessage` turns) and written out in the destination format. Each tool is implemented as a `AgentAdapter` subclass in `agent_migrator/tools/`. This decouples all source/destination pairs — adding a new tool requires only a new adapter; all existing migration paths continue to work unchanged.
+Conversations are read into a tool-agnostic normalized format (`TextMessage` and `ToolCallMessage` turns) and written out in the destination format. Each tool is implemented as a `AgentAdapter` subclass in `agent_migrator/agents/`. This decouples all source/destination pairs — adding a new tool requires only a new adapter; all existing migration paths continue to work unchanged.
 
 ### Extensibility
 
-To add support for a new coding agent, implement the `AgentAdapter` interface in `agent_migrator/tools/` and register it in `cli.py`:
+To add support for a new coding agent, implement the `AgentAdapter` interface in `agent_migrator/agents/` and register it in `cli.py`:
 
 ```python
 class MyAgentAdapter(AgentAdapter):
