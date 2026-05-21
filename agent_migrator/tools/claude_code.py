@@ -634,6 +634,34 @@ class ClaudeCodeAdapter(ToolAdapter):
                             "plan": tc.input.get("plan") or "",
                             "isAgent": False,
                         }
+                    if tc.name == "Glob":
+                        result = tc.result
+                        try:
+                            result_obj = json.loads(result) if isinstance(result, str) else (result or {})
+                        except Exception:
+                            result_obj = {}
+                        filenames = (
+                            result_obj.get("filenames")
+                            or result_obj.get("files")
+                            or []
+                        )
+                        if not isinstance(filenames, list):
+                            filenames = []
+                        return {
+                            "filenames": filenames,
+                            "durationMs": 0,
+                            "numFiles": len(filenames),
+                            "truncated": False,
+                        }
+                    if tc.name == "Read":
+                        content = tc.result if isinstance(tc.result, str) else ""
+                        return {
+                            "type": "text",
+                            "file": {
+                                "filePath": tc.input.get("file_path", ""),
+                                "content": content,
+                            },
+                        }
                     if tc.name == "Write":
                         return {
                             "type": "create",
