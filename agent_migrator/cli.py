@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
@@ -11,6 +12,14 @@ from rich.table import Table
 
 console = Console()
 
+_TOOL_ALIASES: dict[str, str] = {
+    "claude-code": "claude_code",
+    "claude_code":  "claude_code",
+    "codex":        "codex",
+    "cursor":       "cursor",
+    "gemini":       "gemini",
+}
+
 
 def _humanize(n: int) -> str:
     for unit in ("B", "KB", "MB", "GB"):
@@ -20,32 +29,104 @@ def _humanize(n: int) -> str:
     return f"{n} GB"
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        prog="agent-migrator",
-        description="Migrate conversation history between AI coding tools.",
-    )
-    parser.add_argument(
-        "project_path",
-        nargs="?",
-        default=None,
-        help="Path to the project directory (default: current directory).",
-    )
-    args = parser.parse_args()
+def _load_adapters():
+    from agent_migrator.agents.claude_code import ClaudeCodeAdapter
+    from agent_migrator.agents.codex import CodexAdapter
+    from agent_migrator.agents.cursor import CursorAdapter
+    from agent_migrator.agents.gemini import GeminiAdapter
 
+    return [CursorAdapter(), ClaudeCodeAdapter(), CodexAdapter(), GeminiAdapter()]
+
+
+def _find_adapter(tool_alias: str, adapters):
+    """Resolve a tool alias to an adapter. Exits 1 with JSON error if not found."""
+    tool_id = _TOOL_ALIASES.get(tool_alias)
+    if tool_id is None:
+        known = ", ".join(sorted(set(_TOOL_ALIASES.keys())))
+        _json_error(f"Unknown tool '{tool_alias}'. Known tools: {known}")
+    adapter = next((a for a in adapters if a.tool_id == tool_id), None)
+    if adapter is None or not adapter.is_available():
+        _json_error(f"Tool '{tool_alias}' is not installed or not available on this system.")
+    return adapter
+
+
+def _json_error(msg: str) -> None:
+    """Print a JSON error object to stderr and exit 1."""
+    print(json.dumps({"error": msg}), file=sys.stderr)
+    sys.exit(1)
+
+
+def _conv_info_dict(c) -> dict:
+    return {
+        "id":            c.id,
+        "name":          c.name,
+        "updated_at":    c.updated_at.isoformat(),
+        "created_at":    c.created_at.isoformat(),
+        "message_count": c.message_count,
+        "size_bytes":    c.size_bytes,
+    }
+
+
+def _run_list(args, adapters) -> None:
+    project_path = (args.project_path or Path.cwd()).resolve()
+    if not project_path.exists():
+        _json_error(f"Path does not exist: {project_path}")
+
+    source = _find_adapter(args.source_tool, adapters)
+    convs = source.list_conversations(project_path)
+    print(json.dumps([_conv_info_dict(c) for c in convs]))
+
+
+def _run_move(args, adapters) -> None:
+    from agent_migrator.agents.base import AgentNetworkError
+
+    project_path = (args.project_path or Path.cwd()).resolve()
+    if not project_path.exists():
+        _json_error(f"Path does not exist: {project_path}")
+
+    source = _find_adapter(args.source_tool, adapters)
+    dest = _find_adapter(args.dest_tool, adapters)
+
+    all_convs = source.list_conversations(project_path)
+
+    if args.conv_id:
+        matching = [c for c in all_convs if c.id == args.conv_id]
+        if not matching:
+            _json_error(f"Conversation '{args.conv_id}' not found in {source.name} for this project.")
+        conv_infos = matching
+    else:
+        conv_infos = all_convs
+
+    if not conv_infos:
+        _json_error(f"No conversations found in {source.name} for this project.")
+
+    results = []
+    for conv_info in conv_infos:
+        conv = source.read_conversation(conv_info.id, project_path)
+        try:
+            new_id = dest.write_conversation(conv, project_path)
+            results.append({"source_id": conv_info.id, "destination_id": new_id, "name": conv_info.name})
+        except AgentNetworkError as e:
+            if args.allow_cursor_fallback:
+                new_id = dest.write_conversation(conv, project_path, use_local_backend=True)
+                results.append({
+                    "source_id": conv_info.id, "destination_id": new_id,
+                    "name": conv_info.name, "used_fallback": True,
+                })
+            else:
+                _json_error(str(e))
+
+    print(json.dumps(results))
+
+
+def _run_interactive(args, adapters) -> None:
     project_path = Path(args.project_path).resolve() if args.project_path else Path.cwd().resolve()
 
     if not project_path.exists():
         console.print(f"[red]Error:[/red] path does not exist: {project_path}")
         sys.exit(1)
 
-    from agent_migrator.agents.claude_code import ClaudeCodeAdapter
-    from agent_migrator.agents.codex import CodexAdapter
-    from agent_migrator.agents.cursor import CursorAdapter
-    from agent_migrator.agents.gemini import GeminiAdapter
-
-    all_adapters = [CursorAdapter(), ClaudeCodeAdapter(), CodexAdapter(), GeminiAdapter()]
-    available = [a for a in all_adapters if a.is_available()]
+    available = [a for a in adapters if a.is_available()]
 
     if len(available) < 2:
         names = ", ".join(a.name for a in available) if available else "none"
@@ -90,7 +171,6 @@ def main() -> None:
         )
         sys.exit(0)
 
-    # Build labelled choices for checkbox prompt
     def _label(c) -> str:
         date = c.updated_at.strftime("%Y-%m-%d")
         size = _humanize(c.size_bytes)
@@ -119,8 +199,6 @@ def main() -> None:
     engine = MigrationEngine()
     results = MigrationResult()
 
-    # Track whether the user has already chosen to use the local fallback backend
-    # for all remaining conversations (so we don't ask repeatedly).
     use_local_fallback = False
     use_local_fallback_decided = False
 
@@ -130,7 +208,6 @@ def main() -> None:
             console.print(f"{label} ...", end="")
             try:
                 if use_local_fallback:
-                    # User already chose fallback for remaining conversations.
                     conv = src.read_conversation(conv_info.id, project_path)
                     new_id = dst.write_conversation(conv, project_path, use_local_backend=True)
                 else:
@@ -138,7 +215,6 @@ def main() -> None:
                 results.succeeded.append((conv_info, new_id))
                 console.print(" [green]done[/green]")
             except Exception as e:
-                # Check if this is a network upload failure that can fall back to local.
                 from agent_migrator.agents.base import AgentNetworkError
                 if isinstance(e, AgentNetworkError) and not use_local_fallback_decided:
                     use_local_fallback_decided = True
@@ -155,7 +231,6 @@ def main() -> None:
                     ).ask()
                     if fallback:
                         use_local_fallback = True
-                        # Retry this conversation with the fallback.
                         try:
                             conv = src.read_conversation(conv_info.id, project_path)
                             new_id = dst.write_conversation(conv, project_path, use_local_backend=True)
@@ -169,7 +244,6 @@ def main() -> None:
                     else:
                         results.failed.append((conv_info, str(e)))
                 elif isinstance(e, AgentNetworkError) and use_local_fallback:
-                    # Already decided to use fallback — retry silently.
                     try:
                         conv = src.read_conversation(conv_info.id, project_path)
                         new_id = dst.write_conversation(conv, project_path, use_local_backend=True)
@@ -185,7 +259,6 @@ def main() -> None:
     except KeyboardInterrupt:
         console.print("\n[yellow]Cancelled.[/yellow]")
 
-    # Summary
     console.print()
     summary_table = Table(show_header=False, box=None, padding=(0, 1))
     summary_table.add_column("status", width=2)
@@ -198,3 +271,48 @@ def main() -> None:
     border = "green" if not results.failed else "yellow"
     title = f"{len(results.succeeded)} succeeded, {len(results.failed)} failed"
     console.print(Panel(summary_table, title=title, border_style=border))
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        prog="agent-migrator",
+        description="Migrate conversation history between AI coding tools.",
+    )
+    parser.add_argument(
+        "project_path",
+        nargs="?",
+        default=None,
+        help="Project directory for interactive mode (default: cwd).",
+    )
+
+    sub = parser.add_subparsers(dest="command")
+
+    # list subcommand
+    lp = sub.add_parser("list", help="List conversations for a project (outputs JSON).")
+    lp.add_argument("--from", dest="source_tool", required=True, metavar="TOOL",
+                    help="Source tool (claude-code, codex, cursor, gemini).")
+    lp.add_argument("--dir", dest="project_path", type=Path, default=None, metavar="PATH",
+                    help="Project directory (default: cwd).")
+
+    # move subcommand
+    mp = sub.add_parser("move", help="Migrate conversations (outputs JSON).")
+    mp.add_argument("--from", dest="source_tool", required=True, metavar="TOOL",
+                    help="Source tool.")
+    mp.add_argument("--to", dest="dest_tool", required=True, metavar="TOOL",
+                    help="Destination tool.")
+    mp.add_argument("--id", dest="conv_id", default=None, metavar="ID",
+                    help="Source conversation ID. Omit to migrate all conversations.")
+    mp.add_argument("--dir", dest="project_path", type=Path, default=None, metavar="PATH",
+                    help="Project directory (default: cwd).")
+    mp.add_argument("--allow-cursor-fallback", action="store_true",
+                    help="Fall back to local backend if Cursor API upload fails.")
+
+    args = parser.parse_args()
+    adapters = _load_adapters()
+
+    if args.command == "list":
+        _run_list(args, adapters)
+    elif args.command == "move":
+        _run_move(args, adapters)
+    else:
+        _run_interactive(args, adapters)

@@ -33,16 +33,12 @@ uvx agent-migrator
 
 ## Usage
 
+### Interactive
+
 Run from inside a project directory:
 
 ```bash
 agent-migrator
-```
-
-Or pass a path explicitly:
-
-```bash
-agent-migrator /path/to/project
 ```
 
 The CLI walks you through:
@@ -53,6 +49,32 @@ The CLI walks you through:
 4. **Summary** — a results table shows successes and errors.
 
 > **Cursor:** the project path must be a directory that has been opened as a workspace in Cursor at least once.
+
+### Non-interactive
+
+Two subcommands expose the same engine for scripting and agentic use. Both accept `--dir <path>` (defaults to cwd) and print JSON to stdout; errors go to stderr as `{"error": "..."}` with exit 1.
+
+**List conversations:**
+
+```bash
+agent-migrator list --from claude-code --dir /path/to/project
+```
+
+```json
+[{"id": "63ec7bb1-...", "name": "pwa-capabilities-demo", "updated_at": "2026-05-21T23:23:00", ...}]
+```
+
+**Migrate a conversation:**
+
+```bash
+agent-migrator move --from claude-code --to codex --id 63ec7bb1-... --dir /path/to/project
+```
+
+```json
+[{"source_id": "63ec7bb1-...", "destination_id": "019e51f7-...", "name": "pwa-capabilities-demo"}]
+```
+
+Omit `--id` to migrate all conversations for the project. Run `agent-migrator list --help` or `agent-migrator move --help` for full options.
 
 ---
 
