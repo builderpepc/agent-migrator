@@ -66,9 +66,9 @@ All pairs support:
 | Tool calls (Read, Write, Edit, Bash, Glob, and equivalents) | ✓ |
 | Plan (presented natively in the destination tool's plan UI) | ✓ |
 
-**Claude Code → Cursor** is the one exception: plans are migrated as context documents but are not surfaced in Cursor's native plan mode UI.
+**(Any) → Cursor** is the one exception: plans are migrated as context documents but are not surfaced in Cursor's native plan mode UI.
 
-**Claude Code → Cursor** also requires a server upload to Cursor's `ConvertOALToNAL` endpoint to make all models available. If that fails (e.g. not logged in), the CLI offers a local fallback that provides full context but restricts model selection to Anthropic models.
+**(Any) → Cursor** also requires a server upload to Cursor's `ConvertOALToNAL` endpoint to make all models available. If that fails (e.g. not logged in), the CLI offers a local fallback that provides full context but restricts model selection to Anthropic models.
 
 ---
 
