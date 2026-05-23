@@ -58,3 +58,11 @@ Default triggers: `rate_limit`, `billing_error`, `server_error`.
 4. A desktop notification reports success (with the destination session ID) or the reason for failure.
 
 Note: Claude Code's `StopFailure` hook is notification-only — the plugin cannot resume the session automatically. Open the destination tool and resume the migrated session from there.
+
+## Updating
+
+```
+claude plugin update cc-failover
+```
+
+This fetches the latest version from the marketplace source. Updates are only applied when the plugin's version number is bumped — if nothing has changed, the command is a no-op.
