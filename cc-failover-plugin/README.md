@@ -6,7 +6,7 @@ Because Claude cannot respond during a StopFailure, the plugin uses desktop noti
 
 ## Prerequisites
 
-- **agent-migrator** — `uv tool install agent-migrator` (includes notify-py automatically)
+- **agent-migrator** — `uv tool install git+https://github.com/builderpepc/agent-migrator.git` (includes notify-py automatically)
 - **Supported platforms** — Windows 10/11, macOS 10.10+, Linux (libnotify)
 
 ## Installation
