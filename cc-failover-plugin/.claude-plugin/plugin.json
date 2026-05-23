@@ -1,0 +1,22 @@
+{
+  "$schema": "https://raw.githubusercontent.com/anthropics/claude-code/main/plugin-schema.json",
+  "name": "cc-failover",
+  "displayName": "Claude Code Failover",
+  "version": "0.1.0",
+  "description": "Migrates the current session to a fallback coding agent when Claude Code hits a StopFailure event (rate limit, billing error, server outage, etc.).",
+  "userConfig": {
+    "destination": {
+      "type": "string",
+      "title": "Destination tool",
+      "description": "Agent to migrate to on failure. Accepted values: codex, gemini, cursor",
+      "required": true
+    },
+    "trigger_errors": {
+      "type": "string",
+      "multiple": true,
+      "title": "Error types that trigger migration",
+      "description": "StopFailure error codes that should auto-migrate. Options: rate_limit, billing_error, server_error, max_output_tokens, authentication_failed",
+      "default": "rate_limit"
+    }
+  }
+}

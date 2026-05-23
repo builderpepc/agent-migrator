@@ -4,12 +4,14 @@ version = "0.1.0"
 description = "Migrate conversation history between AI coding tools"
 requires-python = ">=3.10"
 dependencies = [
-    "rich>=14.3.3",
-    "questionary>=2.0.1",
+    "rich>=15.0.0",
+    "questionary>=2.1.1",
+    "notify-py>=0.3.43",
 ]
 
 [project.scripts]
 agent-migrator = "agent_migrator.cli:main"
+agent-migrator-hook = "agent_migrator.on_stop_failure:main"
 
 [build-system]
 requires = ["hatchling"]
