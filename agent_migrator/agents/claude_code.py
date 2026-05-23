@@ -311,7 +311,7 @@ def _structured_patch(old_string: str, new_string: str) -> list[dict]:
 
 class ClaudeCodeAdapter(AgentAdapter):
     name = "Claude Code"
-    tool_id = "claude_code"
+    agent_id = "claude_code"
 
     def is_available(self) -> bool:
         return _claude_dir().exists()
@@ -343,7 +343,7 @@ class ClaudeCodeAdapter(AgentAdapter):
                 created_at=created_at,
                 message_count=message_count,
                 size_bytes=size,
-                source_tool=self.tool_id,
+                source_agent=self.agent_id,
             ))
 
         results.sort(key=lambda c: c.updated_at, reverse=True)
@@ -521,7 +521,7 @@ class ClaudeCodeAdapter(AgentAdapter):
             created_at=created_at,
             message_count=sum(1 for t in turns if isinstance(t, TextMessage)),
             size_bytes=jsonl_file.stat().st_size,
-            source_tool=self.tool_id,
+            source_agent=self.agent_id,
         )
 
         # Read associated plan: check the plan file first (most up-to-date),

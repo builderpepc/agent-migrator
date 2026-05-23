@@ -19,9 +19,9 @@ class AgentNetworkError(Exception):
 
 class AgentAdapter(ABC):
     """
-    Abstract base class for an AI coding tool's conversation storage.
+    Abstract base class for an AI coding agent's conversation storage.
 
-    To add support for a new tool:
+    To add support for a new agent:
     1. Subclass AgentAdapter and implement all abstract methods.
     2. Add an instance of the subclass to the adapter list in cli.py.
     """
@@ -29,12 +29,12 @@ class AgentAdapter(ABC):
     #: Human-readable display name shown in the TUI (e.g. "Cursor")
     name: str
 
-    #: Stable identifier used in ConversationInfo.source_tool (e.g. "cursor")
-    tool_id: str
+    #: Stable identifier used in ConversationInfo.source_agent (e.g. "cursor")
+    agent_id: str
 
     @abstractmethod
     def is_available(self) -> bool:
-        """Return True if this tool's storage directory exists on this system."""
+        """Return True if this agent's storage directory exists on this system."""
 
     @abstractmethod
     def list_conversations(self, project_path: Path) -> list[ConversationInfo]:
@@ -70,7 +70,7 @@ class AgentAdapter(ABC):
         AgentNetworkError (or a subclass) if a remote upload fails and a local
         fallback is available.
 
-        Returns the new conversation ID assigned by this tool.
+        Returns the new conversation ID assigned by this agent.
         """
 
     @abstractmethod

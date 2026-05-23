@@ -12,7 +12,7 @@ from rich.table import Table
 
 console = Console()
 
-_TOOL_ALIASES: dict[str, str] = {
+_AGENT_ALIASES: dict[str, str] = {
     "claude-code": "claude_code",
     "claude_code":  "claude_code",
     "codex":        "codex",
@@ -38,15 +38,15 @@ def _load_adapters():
     return [CursorAdapter(), ClaudeCodeAdapter(), CodexAdapter(), GeminiAdapter()]
 
 
-def _find_adapter(tool_alias: str, adapters):
-    """Resolve a tool alias to an adapter. Exits 1 with JSON error if not found."""
-    tool_id = _TOOL_ALIASES.get(tool_alias)
-    if tool_id is None:
-        known = ", ".join(sorted(set(_TOOL_ALIASES.keys())))
-        _json_error(f"Unknown agent '{tool_alias}'. Known agents: {known}")
-    adapter = next((a for a in adapters if a.tool_id == tool_id), None)
+def _find_adapter(agent_alias: str, adapters):
+    """Resolve an agent alias to an adapter. Exits 1 with JSON error if not found."""
+    agent_id = _AGENT_ALIASES.get(agent_alias)
+    if agent_id is None:
+        known = ", ".join(sorted(set(_AGENT_ALIASES.keys())))
+        _json_error(f"Unknown agent '{agent_alias}'. Known agents: {known}")
+    adapter = next((a for a in adapters if a.agent_id == agent_id), None)
     if adapter is None or not adapter.is_available():
-        _json_error(f"Agent '{tool_alias}' is not installed or not available on this system.")
+        _json_error(f"Agent '{agent_alias}' is not installed or not available on this system.")
     return adapter
 
 
@@ -72,7 +72,7 @@ def _run_list(args, adapters) -> None:
     if not project_path.exists():
         _json_error(f"Path does not exist: {project_path}")
 
-    source = _find_adapter(args.source_tool, adapters)
+    source = _find_adapter(args.source_agent, adapters)
     convs = source.list_conversations(project_path)
     print(json.dumps([_conv_info_dict(c) for c in convs]))
 
@@ -84,8 +84,8 @@ def _run_move(args, adapters) -> None:
     if not project_path.exists():
         _json_error(f"Path does not exist: {project_path}")
 
-    source = _find_adapter(args.source_tool, adapters)
-    dest = _find_adapter(args.dest_tool, adapters)
+    source = _find_adapter(args.source_agent, adapters)
+    dest = _find_adapter(args.dest_agent, adapters)
 
     all_convs = source.list_conversations(project_path)
 
@@ -148,9 +148,9 @@ def _run_interactive(args, adapters) -> None:
     src = next(a for a in available if a.name == src_name)
 
     # Pick destination (exclude source)
-    dst_choices = [a.name for a in available if a.tool_id != src.tool_id]
+    dst_choices = [a.name for a in available if a.agent_id != src.agent_id]
     if len(dst_choices) == 1:
-        dst = next(a for a in available if a.tool_id != src.tool_id)
+        dst = next(a for a in available if a.agent_id != src.agent_id)
         console.print(f"Destination agent: {dst.name}")
     else:
         dst_name = questionary.select(
@@ -289,16 +289,16 @@ def main() -> None:
 
     # list subcommand
     lp = sub.add_parser("list", help="List conversations for a project (outputs JSON).")
-    lp.add_argument("--from", dest="source_tool", required=True, metavar="TOOL",
+    lp.add_argument("--from", dest="source_agent", required=True, metavar="AGENT",
                     help="Source agent (claude-code, codex, cursor, gemini).")
     lp.add_argument("--dir", dest="project_path", type=Path, default=None, metavar="PATH",
                     help="Project directory (default: cwd).")
 
     # move subcommand
     mp = sub.add_parser("move", help="Migrate conversations (outputs JSON).")
-    mp.add_argument("--from", dest="source_tool", required=True, metavar="TOOL",
+    mp.add_argument("--from", dest="source_agent", required=True, metavar="AGENT",
                     help="Source agent.")
-    mp.add_argument("--to", dest="dest_tool", required=True, metavar="TOOL",
+    mp.add_argument("--to", dest="dest_agent", required=True, metavar="AGENT",
                     help="Destination agent.")
     mp.add_argument("--id", dest="conv_id", default=None, metavar="ID",
                     help="Source conversation ID. Omit to migrate all conversations.")
