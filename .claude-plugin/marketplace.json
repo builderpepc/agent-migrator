@@ -1,0 +1,18 @@
+{
+  "name": "agent-migrator",
+  "description": "Claude Code plugins from the agent-migrator project.",
+  "owner": {
+    "name": "builderpepc"
+  },
+  "plugins": [
+    {
+      "name": "cc-failover",
+      "description": "Automatically migrates your Claude Code session to a fallback agent on StopFailure events (rate limit, billing error, server outage, etc.).",
+      "source": {
+        "source": "git-subdir",
+        "url": "https://github.com/builderpepc/agent-migrator.git",
+        "path": "cc-failover-plugin"
+      }
+    }
+  ]
+}
