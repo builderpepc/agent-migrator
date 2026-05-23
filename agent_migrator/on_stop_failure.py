@@ -28,12 +28,11 @@ def main() -> None:
     cwd = hook_input.get("cwd", ".")
     error = hook_input.get("error", "unknown")
 
-    # Resolve config. Claude Code is expected to expose userConfig values as
-    # CLAUDE_PLUGIN_CONFIG_<KEY> environment variables when running hooks.
+    # Claude Code exposes userConfig values as CLAUDE_PLUGIN_OPTION_<KEY> env vars.
     # Falls back to a config.json in CLAUDE_PLUGIN_DATA if the env vars are absent
     # (e.g. when the plugin is loaded via --plugin-dir without a persistent install).
-    destination = os.environ.get("CLAUDE_PLUGIN_CONFIG_DESTINATION")
-    trigger_raw = os.environ.get("CLAUDE_PLUGIN_CONFIG_TRIGGER_ERRORS")
+    destination = os.environ.get("CLAUDE_PLUGIN_OPTION_DESTINATION")
+    trigger_raw = os.environ.get("CLAUDE_PLUGIN_OPTION_TRIGGER_ERRORS")
     trigger_errors: set[str] | None = set(trigger_raw.split(",")) if trigger_raw else None
 
     if not destination or trigger_errors is None:

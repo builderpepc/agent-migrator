@@ -11,14 +11,18 @@ Because Claude cannot respond during a StopFailure, the plugin uses desktop noti
 
 ## Installation
 
-```
-claude plugin install ./cc-failover-plugin
-```
-
-For project-scoped installation (shared via version control):
+**From the GitHub repo (recommended):**
 
 ```
-claude plugin install ./cc-failover-plugin --scope project
+claude plugin marketplace add builderpepc/agent-migrator --sparse .claude-plugin cc-failover-plugin
+claude plugin install cc-failover
+```
+
+**From a local clone:**
+
+```
+claude plugin marketplace add ./agent-migrator
+claude plugin install cc-failover
 ```
 
 ## Enable
