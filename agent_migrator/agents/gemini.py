@@ -111,7 +111,7 @@ def _find_session_file(chats_dir: Path, conv_id: str) -> Path | None:
 
 class GeminiAdapter(AgentAdapter):
     name = "Gemini"
-    tool_id = "gemini"
+    agent_id = "gemini"
 
     def _project_dir(self, project_path: Path) -> Path:
         return _GEMINI_STORAGE / project_path.name
@@ -180,7 +180,7 @@ class GeminiAdapter(AgentAdapter):
                     created_at=start,
                     message_count=msg_count,
                     size_bytes=size,
-                    source_tool="gemini",
+                    source_agent="gemini",
                 ))
             except Exception:
                 continue
@@ -315,7 +315,7 @@ class GeminiAdapter(AgentAdapter):
             created_at=datetime.now(timezone.utc),
             message_count=sum(1 for t in turns if isinstance(t, TextMessage)),
             size_bytes=jsonl_file.stat().st_size,
-            source_tool="gemini",
+            source_agent="gemini",
         )
 
         return Conversation(info=info, turns=turns, plan_content=plan_content)

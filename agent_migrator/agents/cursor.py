@@ -1205,7 +1205,7 @@ def _first_user_text(global_db: sqlite3.Connection, composer_id: str, bubble_ite
 
 class CursorAdapter(AgentAdapter):
     name = "Cursor"
-    tool_id = "cursor"
+    agent_id = "cursor"
 
     def is_available(self) -> bool:
         return _global_db_path().exists()
@@ -1267,7 +1267,7 @@ class CursorAdapter(AgentAdapter):
                 created_at=_ms_to_dt(created_ms),
                 message_count=text_turn_count,
                 size_bytes=size,
-                source_tool=self.tool_id,
+                source_agent=self.agent_id,
             ))
 
         con.close()
@@ -1383,7 +1383,7 @@ class CursorAdapter(AgentAdapter):
             created_at=_ms_to_dt(created_ms),
             message_count=sum(1 for t in turns if isinstance(t, TextMessage)),
             size_bytes=0,
-            source_tool=self.tool_id,
+            source_agent=self.agent_id,
         )
         return Conversation(info=info, turns=turns, plan_content=plan_content)
 

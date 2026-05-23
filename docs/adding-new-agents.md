@@ -88,7 +88,7 @@ If a source tool uses a native tool name that has no standard equivalent, pass i
 
 ---
 
-## The `AgentAdapter` ABC (`tools/base.py`)
+## The `AgentAdapter` ABC (`agents/base.py`)
 
 Create a subclass and implement all five methods:
 
@@ -97,7 +97,7 @@ from agent_migrator.agents.base import AgentAdapter, AgentNetworkError
 
 class MyAgentAdapter(AgentAdapter):
     name = "My Tool"       # shown in the TUI
-    tool_id = "my_tool"    # used in ConversationInfo.source_tool; must be unique
+    agent_id = "my_tool"   # used in ConversationInfo.source_agent; must be unique
 
     def is_available(self) -> bool:
         # Return True if this tool is installed / its storage exists on this machine.

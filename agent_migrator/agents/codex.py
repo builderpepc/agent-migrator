@@ -411,7 +411,7 @@ def _extract_display_name(path: Path, session_id: str) -> str:
 
 class CodexAdapter(AgentAdapter):
     name = "Codex"
-    tool_id = "codex"
+    agent_id = "codex"
 
     def is_available(self) -> bool:
         return _codex_dir().exists()
@@ -453,7 +453,7 @@ class CodexAdapter(AgentAdapter):
                 created_at=created_at,
                 message_count=message_count,
                 size_bytes=size,
-                source_tool=self.tool_id,
+                source_agent=self.agent_id,
             ))
 
         results.sort(key=lambda c: c.updated_at, reverse=True)
@@ -698,7 +698,7 @@ class CodexAdapter(AgentAdapter):
             created_at=created_at,
             message_count=sum(1 for t in turns if isinstance(t, TextMessage)),
             size_bytes=rollout_file.stat().st_size,
-            source_tool=self.tool_id,
+            source_agent=self.agent_id,
         )
         return Conversation(info=info, turns=turns, plan_content=plan_content, model=model)
 
