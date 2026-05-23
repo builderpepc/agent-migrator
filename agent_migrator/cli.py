@@ -43,10 +43,10 @@ def _find_adapter(tool_alias: str, adapters):
     tool_id = _TOOL_ALIASES.get(tool_alias)
     if tool_id is None:
         known = ", ".join(sorted(set(_TOOL_ALIASES.keys())))
-        _json_error(f"Unknown tool '{tool_alias}'. Known tools: {known}")
+        _json_error(f"Unknown agent '{tool_alias}'. Known agents: {known}")
     adapter = next((a for a in adapters if a.tool_id == tool_id), None)
     if adapter is None or not adapter.is_available():
-        _json_error(f"Tool '{tool_alias}' is not installed or not available on this system.")
+        _json_error(f"Agent '{tool_alias}' is not installed or not available on this system.")
     return adapter
 
 
@@ -131,7 +131,7 @@ def _run_interactive(args, adapters) -> None:
     if len(available) < 2:
         names = ", ".join(a.name for a in available) if available else "none"
         console.print(
-            f"[red]Error:[/red] at least 2 supported tools must be installed.\n"
+            f"[red]Error:[/red] at least 2 supported agents must be installed.\n"
             f"Detected: {names}"
         )
         sys.exit(1)
@@ -140,7 +140,7 @@ def _run_interactive(args, adapters) -> None:
 
     # Pick source
     src_name = questionary.select(
-        "Source tool:",
+        "Source agent:",
         choices=[a.name for a in available],
     ).ask()
     if src_name is None:
@@ -151,10 +151,10 @@ def _run_interactive(args, adapters) -> None:
     dst_choices = [a.name for a in available if a.tool_id != src.tool_id]
     if len(dst_choices) == 1:
         dst = next(a for a in available if a.tool_id != src.tool_id)
-        console.print(f"Destination tool: {dst.name}")
+        console.print(f"Destination agent: {dst.name}")
     else:
         dst_name = questionary.select(
-            "Destination tool:",
+            "Destination agent:",
             choices=dst_choices,
         ).ask()
         if dst_name is None:
@@ -276,7 +276,7 @@ def _run_interactive(args, adapters) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="agent-migrator",
-        description="Migrate conversation history between AI coding tools.",
+        description="Migrate conversation history between AI coding agents.",
     )
     parser.add_argument(
         "project_path",
@@ -290,16 +290,16 @@ def main() -> None:
     # list subcommand
     lp = sub.add_parser("list", help="List conversations for a project (outputs JSON).")
     lp.add_argument("--from", dest="source_tool", required=True, metavar="TOOL",
-                    help="Source tool (claude-code, codex, cursor, gemini).")
+                    help="Source agent (claude-code, codex, cursor, gemini).")
     lp.add_argument("--dir", dest="project_path", type=Path, default=None, metavar="PATH",
                     help="Project directory (default: cwd).")
 
     # move subcommand
     mp = sub.add_parser("move", help="Migrate conversations (outputs JSON).")
     mp.add_argument("--from", dest="source_tool", required=True, metavar="TOOL",
-                    help="Source tool.")
+                    help="Source agent.")
     mp.add_argument("--to", dest="dest_tool", required=True, metavar="TOOL",
-                    help="Destination tool.")
+                    help="Destination agent.")
     mp.add_argument("--id", dest="conv_id", default=None, metavar="ID",
                     help="Source conversation ID. Omit to migrate all conversations.")
     mp.add_argument("--dir", dest="project_path", type=Path, default=None, metavar="PATH",
