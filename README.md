@@ -20,7 +20,7 @@ Requires [uv](https://docs.astral.sh/uv/).
 **Install globally** (recommended):
 
 ```bash
-uv tool install git+https://github.com/builderpepc/agent-migrator.git
+uv tool install agent-migrator
 ```
 
 **Or run without installing:**
