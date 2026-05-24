@@ -1,7 +1,12 @@
 [project]
 name = "agent-migrator"
 version = "0.1.0"
-description = "Migrate conversation history between AI coding tools"
+description = "Migrate conversation history between AI coding agents"
+readme = "README.md"
+license = { text = "CC-BY-SA-4.0" }
+authors = [
+    { name = "Troy Gunawardene", email = "gunawardene.t@northeastern.edu" }
+]
 requires-python = ">=3.10"
 dependencies = [
     "rich>=15.0.0",
@@ -12,6 +17,10 @@ dependencies = [
 [project.scripts]
 agent-migrator = "agent_migrator.cli:main"
 agent-migrator-hook = "agent_migrator.on_stop_failure:main"
+
+[project.urls]
+Homepage = "https://github.com/builderpepc/agent-migrator"
+Repository = "https://github.com/builderpepc/agent-migrator"
 
 [build-system]
 requires = ["hatchling"]
