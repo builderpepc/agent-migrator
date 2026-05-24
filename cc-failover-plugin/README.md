@@ -15,28 +15,26 @@ Because Claude cannot respond during a StopFailure, the plugin uses desktop noti
 
 ```
 claude plugin marketplace add builderpepc/agent-migrator --sparse .claude-plugin cc-failover-plugin
-claude plugin install cc-failover
+claude plugin install cc-failover --config destination=<agent> --config "trigger_errors=rate_limit,billing_error,server_error"
+claude plugin enable cc-failover
 ```
 
 **From a local clone:**
 
 ```
 claude plugin marketplace add ./agent-migrator
-claude plugin install cc-failover
-```
-
-## Enable
-
-```
+claude plugin install cc-failover --config destination=<agent> --config "trigger_errors=rate_limit,billing_error,server_error"
 claude plugin enable cc-failover
 ```
 
-You will be prompted for:
+Replace `<agent>` with `codex`, `gemini`, or `cursor`.
 
-| Field | Description |
+| Config key | Description |
 |---|---|
-| **Destination tool** | Agent to migrate to: `codex`, `gemini`, or `cursor` |
-| **Error types** | Which error codes should trigger migration (see below) |
+| **`destination`** | Agent to migrate to on failure |
+| **`trigger_errors`** | Comma-separated error codes that trigger migration |
+
+To change config after installation, use `/plugin configure cc-failover` inside a Claude Code session.
 
 ## Supported error types
 
