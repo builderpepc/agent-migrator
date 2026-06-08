@@ -344,6 +344,29 @@ def _last_timestamp(path: Path) -> datetime | None:
     return last_ts
 
 
+def _patch_apply_statuses(path: Path) -> dict[str, bool]:
+    """Return Codex apply_patch success states keyed by call_id."""
+    statuses: dict[str, bool] = {}
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                try:
+                    rec = json.loads(line)
+                except Exception:
+                    continue
+                if rec.get("type") != "event_msg":
+                    continue
+                payload = rec.get("payload", {})
+                if (
+                    payload.get("type") == "patch_apply_end"
+                    and payload.get("call_id")
+                ):
+                    statuses[payload["call_id"]] = bool(payload.get("success"))
+    except Exception:
+        pass
+    return statuses
+
+
 def _count_message_lines(path: Path) -> int:
     """Fast count of user/assistant message records without full parsing."""
     count = 0
@@ -466,6 +489,7 @@ class CodexAdapter(AgentAdapter):
 
         turns: list = []
         pending_tool_calls: dict[str, ToolCallMessage] = {}
+        patch_apply_statuses = _patch_apply_statuses(rollout_file)
         model: str | None = None
 
         meta = _read_session_meta(rollout_file)
@@ -605,6 +629,21 @@ class CodexAdapter(AgentAdapter):
                     call_id = payload.get("call_id", "")
 
                     if native_name == "apply_patch" and isinstance(raw_input, str):
+                        if (
+                            call_id in patch_apply_statuses
+                            and not patch_apply_statuses[call_id]
+                        ):
+                            tc = ToolCallMessage(
+                                name="apply_patch",
+                                input={"patch": raw_input},
+                                result="",
+                                timestamp=ts,
+                                status="error",
+                            )
+                            turns.append(tc)
+                            if call_id:
+                                pending_tool_calls[call_id] = tc
+                            continue
                         # Expand multi-file patch into individual Write/Edit messages
                         patch_messages: list[ToolCallMessage] = []
                         for op in _read_apply_patch(raw_input):
@@ -615,6 +654,7 @@ class CodexAdapter(AgentAdapter):
                                     input={"file_path": file_path, "content": content},
                                     result="File written successfully.",
                                     timestamp=ts,
+                                    status="success",
                                 ))
                             elif op[0] == "update":
                                 _, file_path, old_str, new_str = op
@@ -627,6 +667,7 @@ class CodexAdapter(AgentAdapter):
                                     },
                                     result="File edited successfully.",
                                     timestamp=ts,
+                                    status="success",
                                 ))
                             # "delete" — omitted; no CC equivalent to show
                         turns.extend(patch_messages)
@@ -884,13 +925,14 @@ class CodexAdapter(AgentAdapter):
                                     patch_input = turn.input.get(
                                         "patch", json.dumps(turn.input)
                                     )
+                                patch_failed = turn.status == "error"
 
                                 f.write(_make_response_item(t_ts, {
                                     "type": "custom_tool_call",
                                     "name": "apply_patch",
                                     "input": patch_input,
                                     "call_id": call_id,
-                                    "status": "completed",
+                                    "status": "failed" if patch_failed else "completed",
                                 }) + "\n")
 
                                 # event_msg/patch_apply_begin + patch_apply_end pair.
@@ -899,34 +941,39 @@ class CodexAdapter(AgentAdapter):
                                 # on_patch_apply_begin during live sessions.  We emit a
                                 # synthetic agent_message per changed file so that file
                                 # operations are visible in the /resume history view.
-                                changes = _parse_apply_patch_changes(patch_input)
-                                for changed_path, change_info in changes.items():
-                                    change_type = change_info.get("type", "update")
-                                    verb = {"add": "Created", "delete": "Deleted"}.get(
-                                        change_type, "Updated"
-                                    )
+                                changes = (
+                                    {}
+                                    if patch_failed
+                                    else _parse_apply_patch_changes(patch_input)
+                                )
+                                if not patch_failed:
+                                    for changed_path, change_info in changes.items():
+                                        change_type = change_info.get("type", "update")
+                                        verb = {"add": "Created", "delete": "Deleted"}.get(
+                                            change_type, "Updated"
+                                        )
+                                        f.write(_make_event({
+                                            "type": "agent_message",
+                                            "message": f"{verb} `{changed_path}`",
+                                            "phase": "commentary",
+                                            "memory_citation": None,
+                                        }) + "\n")
                                     f.write(_make_event({
-                                        "type": "agent_message",
-                                        "message": f"{verb} `{changed_path}`",
-                                        "phase": "commentary",
-                                        "memory_citation": None,
+                                        "type": "patch_apply_begin",
+                                        "call_id": call_id,
+                                        "turn_id": turn_id,
+                                        "auto_approved": True,
+                                        "changes": changes,
                                     }) + "\n")
-                                f.write(_make_event({
-                                    "type": "patch_apply_begin",
-                                    "call_id": call_id,
-                                    "turn_id": turn_id,
-                                    "auto_approved": True,
-                                    "changes": changes,
-                                }) + "\n")
                                 f.write(_make_event({
                                     "type": "patch_apply_end",
                                     "call_id": call_id,
                                     "turn_id": turn_id,
-                                    "stdout": turn.result or "Applied.",
-                                    "stderr": "",
-                                    "success": True,
+                                    "stdout": "" if patch_failed else (turn.result or "Applied."),
+                                    "stderr": turn.result if patch_failed else "",
+                                    "success": not patch_failed,
                                     "changes": changes,
-                                    "status": "completed",
+                                    "status": "failed" if patch_failed else "completed",
                                 }) + "\n")
 
                                 f.write(_make_response_item(t_ts, {

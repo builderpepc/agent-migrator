@@ -56,6 +56,7 @@ class ToolCallMessage:
     input: dict
     result: str              # serialized result string
     timestamp: datetime | None = None
+    status: Literal["success", "error", "unknown"] = "unknown"
 
 
 MessageTurn = Union[TextMessage, ToolCallMessage]

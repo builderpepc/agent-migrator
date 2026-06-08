@@ -68,6 +68,11 @@ _CURSOR_TO_STANDARD_TOOL_MAP: dict[str, str] = {
 }
 
 
+def _cursor_tool_status(tfd: dict) -> str:
+    status = str(tfd.get("status", "")).lower()
+    return "error" if status in {"error", "failed"} else "success"
+
+
 def _adapt_cursor_tool(
     tfd: dict,
     bubble: dict,
@@ -85,6 +90,7 @@ def _adapt_cursor_tool(
     raw_args_str = tfd.get("rawArgs", "")
     params_str = tfd.get("params", "")
     result_str = tfd.get("result", "")
+    failed = _cursor_tool_status(tfd) == "error"
 
     try:
         raw = json.loads(raw_args_str) if raw_args_str else {}
@@ -100,6 +106,9 @@ def _adapt_cursor_tool(
         result_obj = {}
 
     cc_name = _CURSOR_TO_STANDARD_TOOL_MAP.get(name, name)
+
+    if failed and cc_name in {"Edit", "Write", "MultiEdit", "NotebookEdit"}:
+        return name, raw or params, result_str
 
     if cc_name == "Read":
         # rawArgs: {"path": "..."} — maps to CC file_path
@@ -580,6 +589,11 @@ def _adapt_cc_tool(
 
     cursor_name, tool_num = _STANDARD_TO_CURSOR_TOOL_MAP.get(name, (name, 0))
     code_blocks: list = []
+
+    if turn.status == "error" and name in {
+        "Edit", "Write", "MultiEdit", "NotebookEdit"
+    }:
+        return cursor_name, tool_num, json.dumps(inp), raw_result, [], {}
 
     # Build Cursor-format params, result, and codeBlocks based on tool type.
     if name == "Read":
@@ -1370,6 +1384,7 @@ class CursorAdapter(AgentAdapter):
                         name=tool_name,
                         input=input_dict,
                         result=result,
+                        status=_cursor_tool_status(tfd),
                     ))
                 else:
                     # Regular assistant text bubble
@@ -1619,7 +1634,7 @@ class CursorAdapter(AgentAdapter):
                             "toolCallId": tool_call_id,
                             "toolIndex": 0,
                             "modelCallId": tool_call_id,
-                            "status": "completed",
+                            "status": "error" if turn.status == "error" else "completed",
                             "name": cursor_name,
                             "rawArgs": json.dumps(turn.input),
                             "tool": tool_num,
