@@ -1063,17 +1063,97 @@ def _folder_uri_to_path(uri: str) -> Path:
     return Path(decoded)
 
 
+def _wsl_uri_to_key(folder_uri: str) -> str | None:
+    """
+    Convert a Remote-WSL folder URI to a canonical comparison key.
+
+    When a project is opened inside WSL, Cursor records its workspace.json
+    ``folder`` as a vscode-remote URI rather than a local ``file://`` one, e.g.::
+
+        vscode-remote://wsl+Ubuntu/home/user/project
+        vscode-remote://wsl%2BUbuntu/home/user/project   (percent-encoded '+')
+
+    Both forms map to ``"wsl:ubuntu:/home/user/project"``.  The distro is
+    lower-cased (WSL distro names are matched case-insensitively) while the
+    Linux path keeps its case.  Returns None for non-WSL remote URIs.
+    """
+    prefix = "vscode-remote://"
+    if not folder_uri.startswith(prefix):
+        return None
+    rest = folder_uri[len(prefix):]
+    slash = rest.find("/")
+    authority, path = (rest, "") if slash == -1 else (rest[:slash], rest[slash:])
+    authority = unquote(authority)  # wsl+Ubuntu (handles wsl%2BUbuntu too)
+    if not authority.startswith("wsl+"):
+        return None
+    distro = authority[len("wsl+"):]
+    linux_path = unquote(path).rstrip("/") or "/"
+    return f"wsl:{distro.lower()}:{linux_path}"
+
+
+def _wsl_path_to_key(project_path: Path) -> str | None:
+    """
+    Convert a Windows WSL UNC path to the same canonical key as
+    :func:`_wsl_uri_to_key`, so a project targeted on the Windows side matches
+    the remote workspace Cursor recorded.
+
+        \\\\wsl.localhost\\Ubuntu\\home\\user\\project
+        \\\\wsl$\\Ubuntu\\home\\user\\project
+      -> "wsl:ubuntu:/home/user/project"
+
+    Returns None if the path is not a WSL UNC path.
+    """
+    norm = str(project_path).replace("\\", "/")
+    low = norm.lower()
+    # Strip Windows extended-length UNC prefix (\\?\UNC\server\...) if present.
+    if low.startswith("//?/unc/"):
+        norm = "//" + norm[len("//?/unc/"):]
+        low = norm.lower()
+    elif low.startswith("//?/"):
+        norm = norm[len("//?/"):]
+        low = norm.lower()
+    for host in ("wsl.localhost", "wsl$"):
+        host_prefix = f"//{host}/"
+        if low.startswith(host_prefix.lower()):
+            rest = norm[len(host_prefix):]
+            distro, _, tail = rest.partition("/")
+            linux_path = ("/" + tail).rstrip("/") or "/"
+            return f"wsl:{distro.lower()}:{linux_path}"
+    return None
+
+
+def _project_path_key(project_path: Path) -> str:
+    """Canonical match key for the target project directory (WSL-aware)."""
+    wsl = _wsl_path_to_key(project_path)
+    if wsl is not None:
+        return wsl
+    return os.path.normcase(str(project_path.resolve()))
+
+
+def _folder_uri_key(folder_uri: str) -> str | None:
+    """
+    Canonical match key for a workspace.json ``folder`` URI, or None if the URI
+    is a remote type this tool can't map to a local target.
+    """
+    if folder_uri.startswith("file://"):
+        return os.path.normcase(str(_folder_uri_to_path(folder_uri).resolve()))
+    return _wsl_uri_to_key(folder_uri)
+
+
 def _find_workspace_dir(project_path: Path) -> Path | None:
     """
     Walk workspaceStorage looking for the directory whose workspace.json
-    folder URI resolves to *project_path*.
+    folder resolves to *project_path*.
 
-    Comparison is case-insensitive on Windows (os.path.normcase handles this).
+    Handles both local ``file://`` workspaces and Remote-WSL workspaces
+    (``vscode-remote://wsl+<distro>/...``).  Local comparison is
+    case-insensitive on Windows (os.path.normcase); WSL comparison normalises
+    the UNC/URI forms to a shared key (see :func:`_wsl_path_to_key`).
     """
     ws_dir = _workspace_storage_dir()
     if not ws_dir.exists():
         return None
-    target = os.path.normcase(str(project_path.resolve()))
+    target = _project_path_key(project_path)
     for entry in ws_dir.iterdir():
         ws_json = entry / "workspace.json"
         if not ws_json.exists():
@@ -1083,11 +1163,8 @@ def _find_workspace_dir(project_path: Path) -> Path | None:
             folder_uri = data.get("folder", "")
             if not folder_uri:
                 continue
-            # Only handle local file:// URIs; skip vscode-remote:// etc.
-            if not folder_uri.startswith("file://"):
-                continue
-            candidate = os.path.normcase(str(_folder_uri_to_path(folder_uri).resolve()))
-            if candidate == target:
+            candidate = _folder_uri_key(folder_uri)
+            if candidate is not None and candidate == target:
                 return entry
         except Exception:
             continue
