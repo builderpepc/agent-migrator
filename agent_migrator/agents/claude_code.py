@@ -458,7 +458,10 @@ class ClaudeCodeAdapter(AgentAdapter):
                                     else:
                                         result_text = str(result_content)
                                     if tuid in pending_tool_calls:
-                                        pending_tool_calls[tuid].result = result_text
+                                        tc = pending_tool_calls[tuid]
+                                        tc.result = result_text
+                                        if block.get("is_error"):
+                                            tc.status = "error"
                         else:
                             # Mixed content with text blocks — skip internal CC protocol messages
                             for block in content:
@@ -616,6 +619,14 @@ class ClaudeCodeAdapter(AgentAdapter):
                     the schema marks as required MUST be present here.
                     """
                     if tc.name == "Bash":
+                        if tc.status == "error":
+                            return {
+                                "stdout": "",
+                                "stderr": tc.result or "",
+                                "interrupted": False,
+                                "isImage": False,
+                                "noOutputExpected": False,
+                            }
                         # BashTool output schema: {stdout, stderr, interrupted,
                         # isImage, noOutputExpected, ...} — all required/with defaults.
                         # Omitting any causes safeParse to fail → invisible result.
@@ -663,6 +674,8 @@ class ClaudeCodeAdapter(AgentAdapter):
                             },
                         }
                     if tc.name == "Write":
+                        if tc.status == "error":
+                            return None
                         return {
                             "type": "create",
                             "filePath": tc.input.get("file_path", ""),
@@ -671,6 +684,8 @@ class ClaudeCodeAdapter(AgentAdapter):
                             "originalFile": None,
                         }
                     if tc.name == "Edit":
+                        if tc.status == "error":
+                            return None
                         old_str = tc.input.get("old_string", "")
                         new_str = tc.input.get("new_string", "")
                         return {
@@ -730,6 +745,7 @@ class ClaudeCodeAdapter(AgentAdapter):
                                     "type": "tool_result",
                                     "tool_use_id": tool_use_id,
                                     "content": tc.result,
+                                    "is_error": tc.status == "error",
                                 }
                             ],
                         }
@@ -737,6 +753,8 @@ class ClaudeCodeAdapter(AgentAdapter):
                         tur = _tool_use_result(tc)
                         if tur is not None:
                             result_record["toolUseResult"] = tur
+                        elif tc.status == "error":
+                            result_record["toolUseResult"] = tc.result
                         f.write(json.dumps(result_record) + "\n")
                         prev_uuid = result_uuid
 
